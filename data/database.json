@@ -1,0 +1,61 @@
+{
+    "ticket_counter": 0,
+    "open_tickets": {},
+    "tickets": {},
+    "suggestions": {
+        "1528656090269749259": {
+            "up": [],
+            "down": []
+        }
+    },
+    "ratings": {},
+    "corrections": {},
+    "dot_sent_users": [],
+    "auto_replies": {},
+    "levels": {
+        "1352870853485920348": {
+            "xp": 51,
+            "level": 0
+        },
+        "1126223776896524388": {
+            "xp": 15,
+            "level": 0
+        },
+        "1506143818473279628": {
+            "xp": 251,
+            "level": 2
+        },
+        "1479340274533793813": {
+            "xp": 111,
+            "level": 0
+        }
+    },
+    "economy": {},
+    "settings": {
+        "ticket_banner_path": null,
+        "suggestion_banner_path": null,
+        "welcome_template_path": "data\\banners\\welcome_template.png",
+        "welcome_position": {
+            "avatar_x": 288,
+            "avatar_y": 403,
+            "avatar_size": 405,
+            "text_x": 768,
+            "text_y": 671,
+            "text_size": 68,
+            "text_color": "#FFFFFF"
+        },
+        "ticket_allowed_roles": []
+    },
+    "voice_tracker": {
+        "voice_channel_id": null,
+        "text_channel_id": null,
+        "message_id": null,
+        "totals": {},
+        "sessions": {}
+    },
+    "bot_voice_uptime": {
+        "voice_channel_id": 1526450513783292004,
+        "connected_since": 1784537355.301829,
+        "total_seconds": 226.03005599975586
+    }
+}
