@@ -153,6 +153,9 @@ def ensure_data_files():
                 "welcome_position": dict(DEFAULT_WELCOME_POSITION),
                 "ticket_allowed_roles": [],   # فاضية = فتح التذاكر متاح للجميع
                 "custom_messages": {},        # {مفتاح_الرسالة: {الحقل: القيمة}} - تعديلات /edit_message
+                "staff_role_ids": [],         # رتب إدارة التذاكر المضافة من ديسكورد (تُضاف فوق STAFF_ROLE_IDS بالـ .env)
+                "custom_ticket_types": {},    # {مفتاح: {"label", "emoji", "description"}} - أنواع تذاكر مضافة من ديسكورد
+                "removed_ticket_types": [],   # مفاتيح أنواع تذاكر افتراضية تم حذفها من ديسكورد
             },
         }
         save_db(default_db)
@@ -174,6 +177,9 @@ def load_db() -> dict:
             "welcome_position": dict(DEFAULT_WELCOME_POSITION),
             "ticket_allowed_roles": [],
             "custom_messages": {},
+            "staff_role_ids": [],
+            "custom_ticket_types": {},
+            "removed_ticket_types": [],
         }
     else:
         data["settings"].setdefault("ticket_banner_path", None)
@@ -182,6 +188,9 @@ def load_db() -> dict:
         data["settings"].setdefault("welcome_position", dict(DEFAULT_WELCOME_POSITION))
         data["settings"].setdefault("ticket_allowed_roles", [])
         data["settings"].setdefault("custom_messages", {})
+        data["settings"].setdefault("staff_role_ids", [])
+        data["settings"].setdefault("custom_ticket_types", {})
+        data["settings"].setdefault("removed_ticket_types", [])
         # تنظيف أي بقايا من نظام الرومات المؤقتة القديم
         data["settings"].pop("temp_voice_hubs", None)
         data["settings"].pop("temp_voice_hub_id", None)
@@ -388,23 +397,26 @@ async def generate_welcome_card(template_path: str, member: discord.Member) -> d
 # =====================================================================
 #                    🎫  إعدادات أنواع التذاكر
 # =====================================================================
-TICKET_TYPES = {
-    "general": {
-        "label": "استفسار",
-        "emoji": "💬",
-        "description": "لأي استفسار عام يخص السيرفر",
-    },
-    "complaint": {
-        "label": "شكوى",
-        "emoji": "🚨",
-        "description": "تقديم شكوى رسمية",
-    },
-    "help": {
-        "label": "مساعدة",
-        "emoji": "🆘",
-        "description": "طلب مساعدة عامة",
-    },
-}
+TICKET_TYPES = {}
+
+
+def sync_dynamic_settings(db: dict | None = None):
+    """يدمج رتب الإدارة وأنواع التذاكر المضافة/المحذوفة من ديسكورد (/set_staff_role و /ticket_type_add
+    و /ticket_type_remove) مع القيم الأساسية بالكود. تُستدعى عند تشغيل البوت وبعد أي تعديل من هالأوامر
+    عشان التغيير يشتغل فوراً بدون الحاجة لإعادة تشغيل البوت."""
+    global STAFF_ROLE_IDS, TICKET_TYPES
+    db = db or load_db()
+    settings = db.get("settings", {})
+
+    for role_id in settings.get("staff_role_ids", []):
+        if role_id not in STAFF_ROLE_IDS:
+            STAFF_ROLE_IDS.append(role_id)
+
+    for key, info in settings.get("custom_ticket_types", {}).items():
+        TICKET_TYPES[key] = info
+
+    for key in settings.get("removed_ticket_types", []):
+        TICKET_TYPES.pop(key, None)
 
 
 # =====================================================================
@@ -1380,8 +1392,16 @@ class ControlPanelView(discord.ui.View):
 # =====================================================================
 @bot.event
 async def on_ready():
+    # دمج رتب الإدارة وأنواع التذاكر المضافة من ديسكورد (لو انحفظت بقاعدة البيانات) قبل تسجيل الفيوهات
+    sync_dynamic_settings()
+
     # تسجيل الفيوهات الدائمة حتى تعمل الأزرار بعد إعادة تشغيل البوت
-    bot.add_view(TicketPanelView())
+    # لوحة التذاكر تحتاج نوع واحد على الأقل (قائمة ديسكورد المنسدلة ما تقبل تكون فاضية) - لو ما زلت
+    # ما ضفت أي نوع بـ /ticket_type_add بترجع نتخطى تسجيلها مؤقتاً بدون ما يوقف تشغيل البوت.
+    if TICKET_TYPES:
+        bot.add_view(TicketPanelView())
+    else:
+        print("⚠️ ما فيه أي نوع تذكرة مضاف بعد - استخدم /ticket_type_add ثم أعد تشغيل البوت لتفعيل لوحة التذاكر.")
     bot.add_view(TicketControlView())
     bot.add_view(SuggestionView())
     bot.add_view(SuggestionPanelView())
@@ -1540,45 +1560,22 @@ def format_duration(total_seconds) -> str:
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    # --- تتبع وقت تواجد البوت نفسه ---
-    # مهم: الانقطاع غير المقصود لا يصفر/يوقف جلسة الوقت.
-    # connected_since يبقى محفوظاً حتى يرجع البوت، لذلك وقت الـ uptime
-    # يستمر ولا يبدأ من الصفر بعد إعادة الاتصال أو إعادة تشغيل Railway.
+    # --- تتبع وقت تواجد البوت نفسه (الكود الأصلي) ---
     if member.id == bot.user.id:
         db = load_db()
-        tracker = db.get("bot_voice_uptime", {
-            "voice_channel_id": None,
-            "connected_since": None,
-            "total_seconds": 0,
-            "intentional_leave": False,
-        })
+        tracker = db.get("bot_voice_uptime", {"voice_channel_id": None, "connected_since": None, "total_seconds": 0})
         now = datetime.now(timezone.utc).timestamp()
 
         if after.channel and not before.channel:
-            # دخل/رجع للروم.
+            # البوت دخل روم صوتي
             tracker["voice_channel_id"] = after.channel.id
-
-            # لا نعيد بداية العداد إذا كانت هناك جلسة محفوظة.
-            if not tracker.get("connected_since"):
-                tracker["connected_since"] = now
-
-            tracker["intentional_leave"] = False
-
+            tracker["connected_since"] = now
         elif before.channel and not after.channel:
-            # إذا كان خروجاً مقصوداً عبر /voice_leave، ننهي الجلسة.
-            # أما الانقطاع غير المقصود فنحتفظ بـ connected_since
-            # حتى لا يتأثر الوقت عند رجوع البوت.
-            if tracker.get("intentional_leave"):
-                started = tracker.get("connected_since")
-                if started:
-                    tracker["total_seconds"] = tracker.get("total_seconds", 0) + max(0, now - started)
-                tracker["connected_since"] = None
-                tracker["voice_channel_id"] = None
-                tracker["intentional_leave"] = False
-            else:
-                # انقطاع/فصل غير مقصود: لا نلمس الوقت.
-                # فقط نبقي voice_channel_id و connected_since محفوظين.
-                pass
+            # البوت طلع/انقطع من الروم - نضيف مدة هذي الجلسة للإجمالي
+            started = tracker.get("connected_since")
+            if started:
+                tracker["total_seconds"] = tracker.get("total_seconds", 0) + max(0, now - started)
+            tracker["connected_since"] = None
 
         db["bot_voice_uptime"] = tracker
         save_db(db)
@@ -2657,6 +2654,11 @@ async def suggestion_panel(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 async def ticket_panel(interaction: discord.Interaction):
     """إرسال لوحة التذاكر الاحترافية مع البنر والعنوان والقائمة."""
+    if not TICKET_TYPES:
+        return await interaction.response.send_message(
+            "❌ ما فيه أي نوع تذكرة مضاف بعد. ضيف نوع واحد على الأقل بالأمر `/ticket_type_add` ثم أعد المحاولة.",
+            ephemeral=True,
+        )
     await send_ticket_panel_message(interaction.channel)
     await interaction.response.send_message("✅ تم إرسال لوحة التذاكر بنجاح.", ephemeral=True)
 
@@ -2736,8 +2738,141 @@ async def set_ticket_role(interaction: discord.Interaction, action: app_commands
         return await interaction.response.send_message(
             "📋 ما فيه قيود حالياً - فتح التذاكر متاح لجميع الأعضاء.", ephemeral=True
         )
-    mentions = "\n".join(f"• <@&{rid}>" for rid in allowed_roles)
-    await interaction.response.send_message(f"📋 الرتب المسموح لها فتح تذاكر حالياً:\n{mentions}", ephemeral=True)
+    mentions = " ".join(f"<@&{rid}>" for rid in allowed_roles)
+    return await interaction.response.send_message(f"📋 الرتب المسموح لها فتح تذاكر:\n{mentions}", ephemeral=True)
+
+
+@bot.tree.command(name="set_staff_role", description="تحديد رتب الإدارة اللي تقدر تشوف وتستلم وتغلق التذاكر - للإدارة فقط")
+@app_commands.describe(action="نوع العملية", role="الرتبة (مطلوبة مع إضافة/إزالة)")
+@app_commands.choices(action=[
+    app_commands.Choice(name="➕ إضافة رتبة", value="add"),
+    app_commands.Choice(name="➖ إزالة رتبة", value="remove"),
+    app_commands.Choice(name="📋 عرض القائمة الحالية", value="list"),
+])
+@app_commands.checks.has_permissions(administrator=True)
+async def set_staff_role(interaction: discord.Interaction, action: app_commands.Choice[str], role: discord.Role = None):
+    db = load_db()
+    staff_roles = db["settings"].setdefault("staff_role_ids", [])
+
+    if action.value == "add":
+        if not role:
+            return await interaction.response.send_message("❌ لازم تحدد رتبة مع خيار الإضافة.", ephemeral=True)
+        if role.id not in staff_roles:
+            staff_roles.append(role.id)
+            save_db(db)
+        if role.id not in STAFF_ROLE_IDS:
+            STAFF_ROLE_IDS.append(role.id)
+        return await interaction.response.send_message(
+            f"✅ صارت رتبة {role.mention} تقدر تشوف وتستلم وتغلق التذاكر فوراً.", ephemeral=True
+        )
+
+    if action.value == "remove":
+        if not role:
+            return await interaction.response.send_message("❌ لازم تحدد رتبة مع خيار الإزالة.", ephemeral=True)
+        if role.id in staff_roles:
+            staff_roles.remove(role.id)
+            save_db(db)
+        if role.id in STAFF_ROLE_IDS:
+            STAFF_ROLE_IDS.remove(role.id)
+        return await interaction.response.send_message(
+            f"✅ تم سحب صلاحية إدارة التذاكر من رتبة {role.mention}.\n"
+            "⚠️ ملاحظة: لو هالرتبة كانت مضبوطة أصلاً بملف .env (STAFF_ROLE_IDS)، بترجع تلقائياً عند إعادة تشغيل البوت "
+            "- لازم تشيلها من هناك كمان لو تبيها تنحذف نهائياً.",
+            ephemeral=True,
+        )
+
+    # action.value == "list"
+    combined = sorted(set(STAFF_ROLE_IDS))
+    if not combined:
+        return await interaction.response.send_message(
+            "📋 ما فيه رتب إدارة تذاكر مضبوطة حالياً.", ephemeral=True
+        )
+    mentions = " ".join(f"<@&{rid}>" for rid in combined)
+    return await interaction.response.send_message(f"📋 رتب إدارة التذاكر الحالية:\n{mentions}", ephemeral=True)
+
+
+# =====================================================================
+#           🎫  إدارة أنواع التذاكر (إضافة/حذف) من ديسكورد مباشرة
+# =====================================================================
+async def ticket_type_autocomplete(interaction: discord.Interaction, current: str):
+    return [
+        app_commands.Choice(name=f"{v['emoji']} {v['label']} ({k})", value=k)
+        for k, v in TICKET_TYPES.items()
+        if current.lower() in k.lower() or current.lower() in v["label"].lower()
+    ][:25]
+
+
+@bot.tree.command(name="ticket_type_add", description="إضافة نوع تذكرة جديد (زي: شراء، شكوى...) يظهر بقائمة فتح التذاكر - للإدارة فقط")
+@app_commands.describe(
+    key="مفتاح داخلي بالإنجليزي بدون مسافات (مثال: purchase)",
+    label="الاسم اللي يظهر للأعضاء (مثال: شراء)",
+    emoji="إيموجي يمثل النوع (مثال: 💰)",
+    description="وصف قصير يظهر تحت الاسم بالقائمة",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def ticket_type_add(interaction: discord.Interaction, key: str, label: str, emoji: str, description: str):
+    key = key.strip().lower().replace(" ", "_")
+    if not key:
+        return await interaction.response.send_message("❌ المفتاح ما يصير فاضي.", ephemeral=True)
+
+    is_first_type = len(TICKET_TYPES) == 0
+
+    db = load_db()
+    custom_types = db["settings"].setdefault("custom_ticket_types", {})
+    custom_types[key] = {"label": label, "emoji": emoji, "description": description}
+    # لو كان هالمفتاح ضمن قائمة المحذوفة سابقاً، نرجعه
+    removed = db["settings"].setdefault("removed_ticket_types", [])
+    if key in removed:
+        removed.remove(key)
+    save_db(db)
+
+    TICKET_TYPES[key] = {"label": label, "emoji": emoji, "description": description}
+
+    note = "📌 أرسل `/ticket_panel` من جديد بروم التذاكر عشان النوع الجديد يظهر بالقائمة."
+    if is_first_type:
+        note = (
+            "⚠️ هذا أول نوع تذكرة تضيفه - لازم تعيد تشغيل البوت مرة وحدة الآن عشان لوحة التذاكر تشتغل، "
+            "وبعدها استخدم `/ticket_panel` عادي بدون ما تحتاج تعيد التشغيل مرة ثانية."
+        )
+
+    await interaction.response.send_message(
+        f"✅ تم إضافة نوع التذكرة {emoji} **{label}**.\n{note}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="ticket_type_remove", description="حذف نوع تذكرة موجود (افتراضي أو مضاف) - للإدارة فقط")
+@app_commands.describe(key="نوع التذكرة اللي تبي تحذفه")
+@app_commands.autocomplete(key=ticket_type_autocomplete)
+@app_commands.checks.has_permissions(administrator=True)
+async def ticket_type_remove(interaction: discord.Interaction, key: str):
+    if key not in TICKET_TYPES:
+        return await interaction.response.send_message("❌ هذا النوع مو موجود أصلاً.", ephemeral=True)
+    if len(TICKET_TYPES) <= 1:
+        return await interaction.response.send_message("❌ ما تقدر تحذف آخر نوع متبقي - لازم يبقى نوع واحد على الأقل.", ephemeral=True)
+
+    label = TICKET_TYPES[key]["label"]
+    db = load_db()
+    db["settings"].setdefault("custom_ticket_types", {}).pop(key, None)
+    removed = db["settings"].setdefault("removed_ticket_types", [])
+    if key not in removed:
+        removed.append(key)
+    save_db(db)
+
+    TICKET_TYPES.pop(key, None)
+
+    await interaction.response.send_message(
+        f"✅ تم حذف نوع التذكرة **{label}**.\n"
+        "📌 أرسل `/ticket_panel` من جديد بروم التذاكر عشان التغيير يظهر بالقائمة.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="ticket_types_list", description="عرض كل أنواع التذاكر الحالية ومفاتيحها - للإدارة فقط")
+@app_commands.checks.has_permissions(administrator=True)
+async def ticket_types_list(interaction: discord.Interaction):
+    lines = [f"{v['emoji']} **{v['label']}** — مفتاحها: `{k}`" for k, v in TICKET_TYPES.items()]
+    await interaction.response.send_message("📋 أنواع التذاكر الحالية:\n" + "\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="voice_join", description="يخلي البوت يدخل ويقعد بروم صوتي معين ويبدأ يحسب وقته فيه - للأونر والإدارة العليا بس")
@@ -2764,18 +2899,6 @@ async def voice_leave(interaction: discord.Interaction):
     voice_client = interaction.guild.voice_client
     if not voice_client:
         return await interaction.response.send_message("❌ البوت مو داخل أي روم صوتي حالياً.", ephemeral=True)
-
-    # علّم الخروج كمقصود حتى لا يعتبره نظام الـ uptime انقطاعاً عابراً.
-    db = load_db()
-    tracker = db.get("bot_voice_uptime", {
-        "voice_channel_id": None,
-        "connected_since": None,
-        "total_seconds": 0,
-        "intentional_leave": False,
-    })
-    tracker["intentional_leave"] = True
-    db["bot_voice_uptime"] = tracker
-    save_db(db)
 
     await voice_client.disconnect()
     await interaction.response.send_message("✅ طلعت من الروم الصوتي.", ephemeral=True)
