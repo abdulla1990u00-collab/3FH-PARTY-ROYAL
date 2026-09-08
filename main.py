@@ -27,6 +27,7 @@ import json
 import re
 import random
 import io
+import math
 import asyncio
 from datetime import datetime, timezone, timedelta
 
@@ -103,6 +104,74 @@ MINES_BOMB_COUNT = 1          # عدد القنابل المخفية
 MINES_MULTIPLIER_STEP = 0.3   # مقدار زيادة الأرباح بكل مربع آمن
 MINES_BASE_REWARD = 100        # المكافأة الأساسية - لا يوجد رهان ولا خصم عند الخسارة
 
+# --- ثيم 3FH BANK (يُطبّق على كل إيمبدات وصور نظام البنك) ---
+BANK_BRAND_NAME = "🏦 3FH BANK"
+BANK_FOOTER_TEXT = "3FH PARTY ROYAL"
+BANK_WHEEL_SLICE_COLORS = [(56, 60, 68, 255), (38, 41, 47, 255)]
+
+# --- نظام البنك الموسّع (بدون سلاش - تكتب الكلمة بروم البنك وتشتغل لحالها) ---
+# مدة الكولداون لكل أمر بالثواني - 0 = جاهز دائمًا بدون انتظار
+BANK_COOLDOWNS = {
+    "راتب": 86400,     # مرة كل 24 ساعة
+    "بخشيش": 300,      # 5 دقائق
+    "حظ": 180,         # 3 دقائق
+    "روليت": 300,      # 5 دقائق
+    "نهب": 600,        # 10 دقائق
+    "رهان": 30,        # نصف دقيقة
+    "استثمار": 291,    # ~4:51 دقيقة (نفس التوقيت اللي بصور السيرفر المرجعي)
+    "تداول": 255,      # ~4:15 دقيقة
+    "قمار": 60,        # دقيقة وحدة
+    "نرد": 274,        # ~4:34 دقيقة
+    "لعبه": 0,
+    "لون": 0,
+    "فواكه": 0,
+    "تسريع": 0,
+    "بيع": 0,
+    "شراء": 0,
+}
+# ترتيب عرض حالة الأوامر بأمر "وقت" (نفس ترتيب صور السيرفر المرجعي)
+BANK_STATUS_ORDER = [
+    "راتب", "بخشيش", "حظ", "روليت", "نهب", "رهان",
+    "استثمار", "تداول", "قمار", "نرد", "لعبه", "لون", "فواكه",
+    "تسريع", "بيع", "شراء",
+]
+
+SALARY_AMOUNT = 2000
+TIP_MIN, TIP_MAX = 200, 900
+LUCK_MIN, LUCK_MAX = -400, 700
+
+ROULETTE_PRIZES = [  # (القيمة أو "gold:عدد", الوزن الاحتمالي)
+    (1500, 22), (6000, 18), (9000, 15), (12000, 12), (15000, 9),
+    (19000, 7), (50000, 4), (100000, 2), ("gold:5", 7), ("gold:10", 4),
+]
+
+ROB_SUCCESS_CHANCE = 0.65
+ROB_PERCENT = 0.01            # نسبة السرقة من رصيد الضحية (1%)
+ROB_FAIL_FINE_PERCENT = 0.02  # غرامة فشل السرقة من رصيد السارق نفسه
+
+PROTECTION_HOURS = 5
+PROTECTION_COST = 2000
+
+INVEST_MIN_PCT, INVEST_MAX_PCT = -0.35, 0.90   # استثمار: مخاطرة أقل ومدى أوسع
+TRADE_MIN_PCT, TRADE_MAX_PCT = -0.55, 1.35     # تداول: مخاطرة أعلى وعائد أسرع وأسرع رجعية
+
+DICE_MIN_BET = GAMBLE_MIN_BET = BET_MIN_BET = 100
+TRADE_MIN_BET, INVEST_MIN_BET = 200, 200
+
+SPEEDUP_GOLD_COST = 30   # تكلفة "تسريع" بالذهب - يشيل كل الكولداونات الحالية دفعة وحدة
+
+# --- متجر الممتلكات (بيع / شراء) ---
+PROPERTY_CATALOG = {
+    "car": {"name": "سياره", "emoji": "🚗", "price": 3000},
+    "house": {"name": "بيت", "emoji": "🏠", "price": 5000},
+    "land": {"name": "اراضي", "emoji": "🗺️", "price": 10000},
+    "store": {"name": "متجر", "emoji": "🏪", "price": 8000},
+    "building": {"name": "مبنى", "emoji": "🏢", "price": 20000},
+    "company": {"name": "شركه", "emoji": "🏭", "price": 50000},
+}
+PROPERTY_SELL_RATIO = 0.6   # يُباع كل عنصر بـ 60% من سعر الشراء
+STOCK_PRICE = 500           # سعر السهم الواحد (ثابت ومبسط)
+
 # --- ألوان الإمبيدات ---
 MAIN_COLOR = 0x2F3136
 SUCCESS_COLOR = 0x57F287
@@ -140,6 +209,11 @@ def ensure_data_files():
             "auto_replies": {},        # {الكلمة_المحفزة: {"response": الرد, "role_id": رتبة اختيارية أو None}} - ردود آلية مخصصة تُضاف من ديسكورد
             "levels": {},              # {user_id: {"xp": int, "level": int}} - نظام اللفلات
             "economy": {},              # {user_id: الرصيد} - نظام البنك
+            "gold": {},                 # {user_id: كمية الذهب} - عملة ثانوية (تسريع...)
+            "properties": {},           # {user_id: {"car":0,"house":0,...,"stocks":0}} - ممتلكات البنك
+            "protection": {},           # {user_id: timestamp انتهاء الحماية من السرقة}
+            "bank_cooldowns": {},       # {user_id: {اسم_الأمر: timestamp الجاهزية}}
+            "bank_history": {},         # {user_id: {"استثمار":[أرصدة سابقة],"تداول":[...]}} - لرسم الشارت
             "dm_broadcast_progress": None,  # حالة رسالة الخاص الجماعية الجارية (لو انقطعت يقدر البوت يكملها بعد إعادة التشغيل)
             "bot_voice_uptime": {       # مدة بقاء البوت نفسه بروم صوتي (يحدده الأونر/الإدارة العليا)
                 "voice_channel_id": None,
@@ -153,9 +227,6 @@ def ensure_data_files():
                 "welcome_position": dict(DEFAULT_WELCOME_POSITION),
                 "ticket_allowed_roles": [],   # فاضية = فتح التذاكر متاح للجميع
                 "custom_messages": {},        # {مفتاح_الرسالة: {الحقل: القيمة}} - تعديلات /edit_message
-                "staff_role_ids": [],         # رتب إدارة التذاكر المضافة من ديسكورد (تُضاف فوق STAFF_ROLE_IDS بالـ .env)
-                "custom_ticket_types": {},    # {مفتاح: {"label", "emoji", "description"}} - أنواع تذاكر مضافة من ديسكورد
-                "removed_ticket_types": [],   # مفاتيح أنواع تذاكر افتراضية تم حذفها من ديسكورد
             },
         }
         save_db(default_db)
@@ -177,9 +248,6 @@ def load_db() -> dict:
             "welcome_position": dict(DEFAULT_WELCOME_POSITION),
             "ticket_allowed_roles": [],
             "custom_messages": {},
-            "staff_role_ids": [],
-            "custom_ticket_types": {},
-            "removed_ticket_types": [],
         }
     else:
         data["settings"].setdefault("ticket_banner_path", None)
@@ -188,9 +256,6 @@ def load_db() -> dict:
         data["settings"].setdefault("welcome_position", dict(DEFAULT_WELCOME_POSITION))
         data["settings"].setdefault("ticket_allowed_roles", [])
         data["settings"].setdefault("custom_messages", {})
-        data["settings"].setdefault("staff_role_ids", [])
-        data["settings"].setdefault("custom_ticket_types", {})
-        data["settings"].setdefault("removed_ticket_types", [])
         # تنظيف أي بقايا من نظام الرومات المؤقتة القديم
         data["settings"].pop("temp_voice_hubs", None)
         data["settings"].pop("temp_voice_hub_id", None)
@@ -205,6 +270,11 @@ def load_db() -> dict:
     data.setdefault("auto_replies", {})
     data.setdefault("levels", {})
     data.setdefault("economy", {})
+    data.setdefault("gold", {})
+    data.setdefault("properties", {})
+    data.setdefault("protection", {})
+    data.setdefault("bank_cooldowns", {})
+    data.setdefault("bank_history", {})
     data.setdefault("dm_broadcast_progress", None)
     return data
 
@@ -287,6 +357,185 @@ def update_balance(user_id: int, delta: int) -> int:
     db["economy"][uid] = new_balance
     save_db(db)
     return new_balance
+
+
+# =====================================================================
+#            🏦  دوال مساعدة لنظام البنك الموسّع (بدون سلاش)
+# =====================================================================
+def format_amount(n: int) -> str:
+    """يهيّئ رقم كبير بصيغة مختصرة (زي 55e86) عشان الأرقام الضخمة تظل قابلة للقراءة."""
+    n = int(n)
+    if n < 100_000:
+        return f"{n:,}"
+    s = str(abs(n))
+    mantissa = s[:2]
+    exponent = len(s) - 2
+    sign = "-" if n < 0 else ""
+    return f"{sign}{mantissa}e{exponent}"
+
+
+def get_gold(user_id: int) -> int:
+    db = load_db()
+    return db["gold"].get(str(user_id), 0)
+
+
+def update_gold(user_id: int, delta: int) -> int:
+    db = load_db()
+    uid = str(user_id)
+    current = db["gold"].get(uid, 0)
+    new_amount = max(0, current + delta)
+    db["gold"][uid] = new_amount
+    save_db(db)
+    return new_amount
+
+
+def get_properties(user_id: int) -> dict:
+    db = load_db()
+    uid = str(user_id)
+    props = db["properties"].get(uid)
+    if not props:
+        props = {key: 0 for key in PROPERTY_CATALOG}
+        props["stocks"] = 0
+        db["properties"][uid] = props
+        save_db(db)
+    else:
+        for key in PROPERTY_CATALOG:
+            props.setdefault(key, 0)
+        props.setdefault("stocks", 0)
+    return props
+
+
+def update_property(user_id: int, key: str, delta: int) -> int:
+    db = load_db()
+    uid = str(user_id)
+    props = db["properties"].setdefault(uid, {k: 0 for k in PROPERTY_CATALOG})
+    props.setdefault("stocks", 0)
+    props[key] = max(0, props.get(key, 0) + delta)
+    save_db(db)
+    return props[key]
+
+
+def net_worth(user_id: int) -> int:
+    """إجمالي الثروة: الكاش + قيمة الممتلكات + قيمة الأسهم (لقائمة الأغنى)."""
+    cash = get_balance(user_id)
+    props = get_properties(user_id)
+    props_value = sum(props.get(k, 0) * PROPERTY_CATALOG[k]["price"] for k in PROPERTY_CATALOG)
+    stocks_value = props.get("stocks", 0) * STOCK_PRICE
+    return cash + props_value + stocks_value
+
+
+def is_protected(user_id: int) -> float:
+    """يرجع 0 لو مو محمي، أو عدد الثواني المتبقية للحماية."""
+    db = load_db()
+    until = db["protection"].get(str(user_id), 0)
+    remaining = until - datetime.now(timezone.utc).timestamp()
+    return max(0.0, remaining)
+
+
+def set_protection(user_id: int, hours: float) -> None:
+    db = load_db()
+    db["protection"][str(user_id)] = datetime.now(timezone.utc).timestamp() + hours * 3600
+    save_db(db)
+
+
+def get_cooldown_remaining(user_id: int, action: str) -> float:
+    duration = BANK_COOLDOWNS.get(action, 0)
+    if duration <= 0:
+        return 0.0
+    db = load_db()
+    ready_at = db["bank_cooldowns"].get(str(user_id), {}).get(action, 0)
+    remaining = ready_at - datetime.now(timezone.utc).timestamp()
+    return max(0.0, remaining)
+
+
+def set_cooldown(user_id: int, action: str) -> None:
+    duration = BANK_COOLDOWNS.get(action, 0)
+    if duration <= 0:
+        return
+    db = load_db()
+    uid = str(user_id)
+    db["bank_cooldowns"].setdefault(uid, {})[action] = datetime.now(timezone.utc).timestamp() + duration
+    save_db(db)
+
+
+def clear_cooldowns(user_id: int) -> None:
+    """يشيل كل الكولداونات الحالية لعضو (تُستخدم بأمر تسريع)."""
+    db = load_db()
+    db["bank_cooldowns"][str(user_id)] = {}
+    save_db(db)
+
+
+def format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours} ساعة {minutes} دقيقة"
+    if minutes:
+        return f"{minutes} دقائق {secs} ثانية"
+    return f"{secs} ثانية"
+
+
+def parse_amount_arg(arg: str | None, balance: int) -> int | None:
+    """يحوّل نص زي 'نص'/'كامل'/'ربع'/رقم إلى مبلغ فعلي حسب رصيد اللاعب."""
+    if not arg:
+        return None
+    arg = arg.strip()
+    if arg in ("كامل", "الكل", "كل"):
+        return balance
+    if arg in ("نص", "نصف"):
+        return balance // 2
+    if arg in ("ربع",):
+        return balance // 4
+    digits = re.sub(r"[^\d]", "", arg)
+    if digits.isdigit() and digits:
+        return int(digits)
+    return None
+
+
+def push_bank_history(user_id: int, game: str, balance_after: int) -> list:
+    db = load_db()
+    uid = str(user_id)
+    history = db["bank_history"].setdefault(uid, {}).setdefault(game, [])
+    history.append(balance_after)
+    del history[:-8]  # نحتفظ بآخر 8 نتائج بس (نفس عدد النقاط بالشارت المرجعي)
+    save_db(db)
+    return history
+
+
+def make_growth_chart(history: list, won: bool) -> discord.File:
+    """يرسم شارت بسيط لآخر نتائج استثمار/تداول العضو، بنفس روح الشارت المرجعي (منطقة مملوءة + خط)."""
+    width, height = 700, 320
+    line_color = (87, 242, 135) if won else (237, 66, 69)
+    fill_color = (*line_color, 60)
+
+    base = Image.new("RGBA", (width, height), (47, 49, 54, 255))
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    values = history if len(history) >= 2 else [0] + history
+    min_v, max_v = min(values), max(values)
+    span = max(1, max_v - min_v)
+    pad_x, pad_y = 40, 30
+    step_x = (width - 2 * pad_x) / max(1, len(values) - 1)
+
+    points = []
+    for i, v in enumerate(values):
+        x = pad_x + i * step_x
+        y = height - pad_y - ((v - min_v) / span) * (height - 2 * pad_y)
+        points.append((x, y))
+
+    polygon = points + [(points[-1][0], height - pad_y), (points[0][0], height - pad_y)]
+    draw.polygon(polygon, fill=fill_color)
+    draw.line(points, fill=line_color, width=4, joint="curve")
+    for x, y in points:
+        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=line_color)
+
+    final_image = Image.alpha_composite(base, overlay).convert("RGB")
+    buffer = io.BytesIO()
+    final_image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return discord.File(buffer, filename="chart.png")
 
 
 # =====================================================================
@@ -397,26 +646,23 @@ async def generate_welcome_card(template_path: str, member: discord.Member) -> d
 # =====================================================================
 #                    🎫  إعدادات أنواع التذاكر
 # =====================================================================
-TICKET_TYPES = {}
-
-
-def sync_dynamic_settings(db: dict | None = None):
-    """يدمج رتب الإدارة وأنواع التذاكر المضافة/المحذوفة من ديسكورد (/set_staff_role و /ticket_type_add
-    و /ticket_type_remove) مع القيم الأساسية بالكود. تُستدعى عند تشغيل البوت وبعد أي تعديل من هالأوامر
-    عشان التغيير يشتغل فوراً بدون الحاجة لإعادة تشغيل البوت."""
-    global STAFF_ROLE_IDS, TICKET_TYPES
-    db = db or load_db()
-    settings = db.get("settings", {})
-
-    for role_id in settings.get("staff_role_ids", []):
-        if role_id not in STAFF_ROLE_IDS:
-            STAFF_ROLE_IDS.append(role_id)
-
-    for key, info in settings.get("custom_ticket_types", {}).items():
-        TICKET_TYPES[key] = info
-
-    for key in settings.get("removed_ticket_types", []):
-        TICKET_TYPES.pop(key, None)
+TICKET_TYPES = {
+    "general": {
+        "label": "استفسار",
+        "emoji": "💬",
+        "description": "لأي استفسار عام يخص السيرفر",
+    },
+    "complaint": {
+        "label": "شكوى",
+        "emoji": "🚨",
+        "description": "تقديم شكوى رسمية",
+    },
+    "help": {
+        "label": "مساعدة",
+        "emoji": "🆘",
+        "description": "طلب مساعدة عامة",
+    },
+}
 
 
 # =====================================================================
@@ -1294,6 +1540,29 @@ HELP_CATEGORIES = {
             ("/control_panel", "إرسال لوحة التحكم العامة بهذا الروم"),
         ],
     },
+    "bank": {
+        "label": "🏦 البنك (بروم البنك - تكتب الكلمة وتشتغل، بدون سلاش)",
+        "emoji": "🏦",
+        "commands": [
+            ("راتب", "استلام راتبك (مرة كل 24 ساعة)"),
+            ("بخشيش", "بخشيش عشوائي صغير"),
+            ("حظ", "جرب حظك - ربح أو خسارة صغيرة"),
+            ("روليت", "عجلة حظ فيها جوائز كاش وذهب"),
+            ("نهب", "حاول تسرق أغنى عضو متاح حاليًا"),
+            ("حماية", "فعّل حماية 5 ساعات من السرقة"),
+            ("رهان <مبلغ/نص/كامل>", "راهن ضد البنك (فرصة 48%)"),
+            ("قمار <مبلغ/نص/كامل>", "قمار بمضاعف عشوائي"),
+            ("نرد <مبلغ/نص/كامل>", "نرد ضد البنك - الأعلى يفوز"),
+            ("استثمار <مبلغ/نص/كامل>", "استثمر بمخاطرة أقل، مع شارت أداء"),
+            ("تداول <مبلغ/نص/كامل>", "تداول بمخاطرة أعلى وربح أسرع"),
+            ("لعبه / لون / فواكه", "ألعاب سريعة بدون كولداون"),
+            ("تسريع", f"يشيل كل الكولداونات مقابل Gold x{SPEEDUP_GOLD_COST}"),
+            ("شراء / بيع", "متجر الممتلكات والأسهم والذهب"),
+            ("ممتلكات", "عرض ممتلكاتك وإجمالي ثروتك"),
+            ("وقت", "حالة جاهزية كل أوامر البنك"),
+            ("اغنى", "أغنى 10 أعضاء بالسيرفر"),
+        ],
+    },
     "admin": {
         "label": "⚙️ إدارة عامة",
         "emoji": "⚙️",
@@ -1392,16 +1661,8 @@ class ControlPanelView(discord.ui.View):
 # =====================================================================
 @bot.event
 async def on_ready():
-    # دمج رتب الإدارة وأنواع التذاكر المضافة من ديسكورد (لو انحفظت بقاعدة البيانات) قبل تسجيل الفيوهات
-    sync_dynamic_settings()
-
     # تسجيل الفيوهات الدائمة حتى تعمل الأزرار بعد إعادة تشغيل البوت
-    # لوحة التذاكر تحتاج نوع واحد على الأقل (قائمة ديسكورد المنسدلة ما تقبل تكون فاضية) - لو ما زلت
-    # ما ضفت أي نوع بـ /ticket_type_add بترجع نتخطى تسجيلها مؤقتاً بدون ما يوقف تشغيل البوت.
-    if TICKET_TYPES:
-        bot.add_view(TicketPanelView())
-    else:
-        print("⚠️ ما فيه أي نوع تذكرة مضاف بعد - استخدم /ticket_type_add ثم أعد تشغيل البوت لتفعيل لوحة التذاكر.")
+    bot.add_view(TicketPanelView())
     bot.add_view(TicketControlView())
     bot.add_view(SuggestionView())
     bot.add_view(SuggestionPanelView())
@@ -1594,6 +1855,12 @@ async def on_message(message: discord.Message):
     if isinstance(message.author, discord.Member):
         await add_message_xp(message.author, message.channel)
 
+    # نظام البنك الموسّع - أوامر نصية بدون سلاش (تشتغل بس بروم البنك لو محدد)
+    if (not BANK_CHANNEL_ID) or message.channel.id == BANK_CHANNEL_ID:
+        handled = await handle_bank_text_command(message)
+        if handled:
+            return
+
     # الردود الآلية تعمل فقط في روم الشات العام (لو تم تحديده)
     channel_ok = (not GENERAL_CHAT_ID) or (message.channel.id == GENERAL_CHAT_ID)
 
@@ -1710,7 +1977,7 @@ class MinesGameView(discord.ui.View):
                 child.disabled = True
             button.label = "💣"
             button.style = discord.ButtonStyle.danger
-            embed = discord.Embed(
+            embed = bank_embed(interaction,
                 title="💥 ما في مكافأة هالمرة!",
                 description="وقعت بالقنبلة. رصيدك ما تأثر، جرب حظك مرة ثانية لاحقًا! 🍀",
                 color=DANGER_COLOR,
@@ -1727,7 +1994,7 @@ class MinesGameView(discord.ui.View):
         self.cash_out_button.disabled = False
 
         potential_win = int(MINES_BASE_REWARD * self.multiplier)
-        embed = discord.Embed(
+        embed = bank_embed(interaction,
             title="⛏️ لعبة البنك - Mines",
             description=(
                 f"اللاعب: {self.player.mention}\n"
@@ -1751,7 +2018,7 @@ class MinesGameView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-        embed = discord.Embed(
+        embed = bank_embed(interaction,
             title="✅ سحبت مكافأتك!",
             description=(
                 f"ربحت **{winnings}** عملة (مضاعف x{self.multiplier:.1f})\n"
@@ -1766,6 +2033,735 @@ class MinesGameView(discord.ui.View):
             # لو انتهت المهلة بدون سحب، ما فيه أي خصم - فقط تنتهي الجولة
             for child in self.children:
                 child.disabled = True
+
+
+# =====================================================================
+#         🏦  نظام البنك الموسّع - أوامر نصية بدون سلاش ولا شرطة
+#   تكتب الكلمة بروم البنك (BANK_CHANNEL_ID) وتشتغل لحالها فورًا
+# =====================================================================
+BANK_KEYWORDS = {
+    "راتب", "بخشيش", "حظ", "روليت", "نهب", "حماية", "رهان",
+    "استثمار", "تداول", "قمار", "نرد", "لعبه", "لون", "فواكه",
+    "تسريع", "بيع", "شراء", "ممتلكات", "وقت", "اغنى",
+}
+
+
+def _load_bank_font(size: int) -> ImageFont.FreeTypeFont:
+    """نفس منطق تحميل خط كرت الترحيب - يستخدم بكل صور نظام البنك."""
+    if WELCOME_FONT_PATH and os.path.exists(WELCOME_FONT_PATH):
+        try:
+            return ImageFont.truetype(WELCOME_FONT_PATH, size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _resolve_bank_identity(ctx):
+    """يرجع (guild, user, رابط أفتار البوت) سواء كان ctx رسالة عادية أو Interaction سلاش."""
+    guild = getattr(ctx, "guild", None)
+    user = getattr(ctx, "author", None) or getattr(ctx, "user", None)
+    bot_avatar = None
+    if guild and guild.me:
+        bot_avatar = guild.me.display_avatar.url
+    elif bot.user:
+        bot_avatar = bot.user.display_avatar.url
+    return guild, user, bot_avatar
+
+
+def bank_embed(ctx, *, title: str, description: str, color: int, thumbnail_user=None) -> discord.Embed:
+    """إيمبد موحّد بثيم 3FH BANK - يُستخدم بكل أوامر البنك (النصية والسلاش)."""
+    guild, user, bot_avatar = _resolve_bank_identity(ctx)
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_author(name=BANK_BRAND_NAME, icon_url=bot_avatar)
+    target_user = thumbnail_user or user
+    if target_user:
+        embed.set_thumbnail(url=target_user.display_avatar.url)
+    embed.set_footer(text=BANK_FOOTER_TEXT, icon_url=bot_avatar)
+    return embed
+
+
+def render_roulette_wheel(prize_labels: list[str], winning_index: int, avatar_bytes: bytes | None = None) -> discord.File:
+    """يرسم عجلة روليت فعلية (نفس روح عجلة السيرفر المرجعي) بثيم ذهبي/داكن، وتوقف على القطاع الفائز."""
+    size = 640
+    center = size // 2
+    radius = size // 2 - 24
+
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    n = max(1, len(prize_labels))
+    sector_angle = 360 / n
+    # نلف نقطة البداية عشان القطاع الفائز يوقف بالضبط عند المؤشر (يمين العجلة = 0 درجة)
+    start_offset = -(winning_index * sector_angle) - sector_angle / 2
+
+    font = _load_bank_font(24)
+    for i, label in enumerate(prize_labels):
+        start = start_offset + i * sector_angle
+        end = start + sector_angle
+        is_winner = i == winning_index
+        color = (241, 196, 15, 255) if is_winner else BANK_WHEEL_SLICE_COLORS[i % 2]
+        draw.pieslice(
+            (center - radius, center - radius, center + radius, center + radius),
+            start, end, fill=color, outline=(15, 15, 17, 255), width=2,
+        )
+        mid_angle = math.radians((start + end) / 2)
+        text_r = radius * 0.68
+        tx = center + text_r * math.cos(mid_angle)
+        ty = center + text_r * math.sin(mid_angle)
+        text_color = (20, 20, 20, 255) if is_winner else (241, 196, 15, 255)
+        bbox = draw.textbbox((0, 0), label, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text((tx - tw / 2, ty - th / 2), label, font=font, fill=text_color)
+
+    draw.ellipse(
+        (center - radius, center - radius, center + radius, center + radius),
+        outline=(241, 196, 15, 255), width=6,
+    )
+
+    # المؤشر الذهبي على يمين العجلة يشاور دايمًا على القطاع الفائز
+    pointer = [(size - 4, center - 20), (size - 4, center + 20), (size - 36, center)]
+    draw.polygon(pointer, fill=(241, 196, 15, 255))
+
+    if avatar_bytes:
+        try:
+            avatar_size = int(radius * 0.55)
+            avatar_img = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((avatar_size, avatar_size))
+            mask = Image.new("L", (avatar_size, avatar_size), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
+            avatar_img.putalpha(mask)
+            image.paste(avatar_img, (center - avatar_size // 2, center - avatar_size // 2), avatar_img)
+            draw.ellipse(
+                (center - avatar_size // 2, center - avatar_size // 2, center + avatar_size // 2, center + avatar_size // 2),
+                outline=(241, 196, 15, 255), width=4,
+            )
+        except Exception:
+            pass
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return discord.File(buffer, filename="roulette.png")
+
+
+def _ask_amount_embed(message: discord.Message, action: str) -> discord.Embed:
+    return bank_embed(message,
+        title="❓ حدد المبلغ",
+        description=f"اكتب المبلغ بعد الأمر، مثال:\n`{action} 5000` أو `{action} نص` أو `{action} كامل`",
+        color=MAIN_COLOR,
+    )
+
+
+def _min_bet_embed(message: discord.Message, min_amount: int) -> discord.Embed:
+    return bank_embed(message,
+        title="❌ المبلغ قليل",
+        description=f"أقل مبلغ مسموح به هنا: **{format_amount(min_amount)}** 💵",
+        color=DANGER_COLOR,
+    )
+
+
+def _not_enough_embed(message: discord.Message, balance: int) -> discord.Embed:
+    return bank_embed(message,
+        title="❌ رصيدك ما يكفي",
+        description=f"رصيدك الحالي: **{format_amount(balance)}** 💵",
+        color=DANGER_COLOR,
+    )
+
+
+async def _check_cooldown(message: discord.Message, action: str) -> bool:
+    remaining = get_cooldown_remaining(message.author.id, action)
+    if remaining > 0:
+        embed = bank_embed(message,
+            title="⏳ لسا بدري",
+            description=f"أمر **{action}** بيصير جاهز بعد **{format_duration(remaining)}**.",
+            color=DANGER_COLOR,
+        )
+        await message.reply(embed=embed, mention_author=False)
+        return False
+    return True
+
+
+# --- راتب / بخشيش / حظ ---
+async def bank_cmd_salary(message: discord.Message):
+    if not await _check_cooldown(message, "راتب"):
+        return
+    set_cooldown(message.author.id, "راتب")
+    new_balance = update_balance(message.author.id, SALARY_AMOUNT)
+    embed = bank_embed(message,
+        title="💼 راتبك",
+        description=f"استلمت راتبك: **{format_amount(SALARY_AMOUNT)}** 💵\nرصيدك الحالي: **{format_amount(new_balance)}**",
+        color=SUCCESS_COLOR,
+    )
+    await message.reply(embed=embed, mention_author=False)
+
+
+async def bank_cmd_tip(message: discord.Message):
+    if not await _check_cooldown(message, "بخشيش"):
+        return
+    set_cooldown(message.author.id, "بخشيش")
+    amount = random.randint(TIP_MIN, TIP_MAX)
+    new_balance = update_balance(message.author.id, amount)
+    embed = bank_embed(message,
+        title="🤑 بخشيش",
+        description=f"حصلت على بخشيش: **{format_amount(amount)}** 💵\nرصيدك الحالي: **{format_amount(new_balance)}**",
+        color=SUCCESS_COLOR,
+    )
+    await message.reply(embed=embed, mention_author=False)
+
+
+async def bank_cmd_luck(message: discord.Message):
+    if not await _check_cooldown(message, "حظ"):
+        return
+    set_cooldown(message.author.id, "حظ")
+    amount = random.randint(LUCK_MIN, LUCK_MAX)
+    new_balance = update_balance(message.author.id, amount)
+    won = amount >= 0
+    embed = bank_embed(message,
+        title="🍀 يومك سعيد!" if won else "😬 حظ نحس اليوم",
+        description=(
+            f"{'ربحت' if won else 'خسرت'} **{format_amount(abs(amount))}** 💵\n"
+            f"رصيدك الحالي: **{format_amount(new_balance)}**"
+        ),
+        color=SUCCESS_COLOR if won else DANGER_COLOR,
+    )
+    await message.reply(embed=embed, mention_author=False)
+
+
+# --- روليت ---
+async def bank_cmd_roulette(message: discord.Message):
+    if not await _check_cooldown(message, "روليت"):
+        return
+    set_cooldown(message.author.id, "روليت")
+    prizes = [p for p, _ in ROULETTE_PRIZES]
+    weights = [w for _, w in ROULETTE_PRIZES]
+    winning_index = random.choices(range(len(prizes)), weights=weights, k=1)[0]
+    prize = prizes[winning_index]
+    labels = [
+        f"G x{p.split(':')[1]}" if isinstance(p, str) and p.startswith("gold:") else format_amount(p)
+        for p in prizes
+    ]
+
+    if isinstance(prize, str) and prize.startswith("gold:"):
+        amount = int(prize.split(":")[1])
+        new_gold = update_gold(message.author.id, amount)
+        embed = bank_embed(message,
+            title="🎡 روليت الحظ",
+            description=f"مبروك! ربحت **Gold x{amount}** 🥇\nذهبك الحالي: **{new_gold}**",
+            color=SUCCESS_COLOR,
+        )
+    else:
+        new_balance = update_balance(message.author.id, prize)
+        embed = bank_embed(message,
+            title="🎡 روليت الحظ",
+            description=f"مبروك! ربحت **{format_amount(prize)}** 💵\nرصيدك الحالي: **{format_amount(new_balance)}**",
+            color=SUCCESS_COLOR,
+        )
+
+    try:
+        avatar_bytes = await message.author.display_avatar.read()
+        wheel_file = render_roulette_wheel(labels, winning_index, avatar_bytes)
+        embed.set_image(url="attachment://roulette.png")
+        await message.reply(embed=embed, file=wheel_file, mention_author=False)
+    except Exception as e:
+        print(f"⚠️ تعذّر رسم عجلة الروليت: {e}")
+        await message.reply(embed=embed, mention_author=False)
+
+
+# --- نهب / حماية ---
+async def bank_cmd_rob(message: discord.Message):
+    if not await _check_cooldown(message, "نهب"):
+        return
+    set_cooldown(message.author.id, "نهب")
+
+    db = load_db()
+    economy = db.get("economy", {})
+    protection = db.get("protection", {})
+    now = datetime.now(timezone.utc).timestamp()
+    ranked = sorted(economy.items(), key=lambda kv: kv[1], reverse=True)
+
+    target_id = None
+    for uid, bal in ranked:
+        if uid == str(message.author.id):
+            continue
+        if bal <= 0:
+            continue
+        if protection.get(uid, 0) > now:
+            continue
+        target_id = uid
+        break
+
+    if not target_id:
+        embed = bank_embed(message,
+            title="🕵️ ما فيه هدف مناسب",
+            description="كل الأعضاء إما محميين أو رصيدهم صفر حاليًا.",
+            color=DANGER_COLOR,
+        )
+        return await message.reply(embed=embed, mention_author=False)
+
+    target_member = message.guild.get_member(int(target_id)) if message.guild else None
+    target_mention = target_member.mention if target_member else f"<@{target_id}>"
+
+    if random.random() < ROB_SUCCESS_CHANCE:
+        target_balance = economy.get(target_id, 0)
+        stolen = max(1, int(target_balance * ROB_PERCENT))
+        update_balance(int(target_id), -stolen)
+        new_balance = update_balance(message.author.id, stolen)
+        embed = bank_embed(message,
+            title="🥷 تمت السرقة بنجاح !!",
+            description=(
+                f"سرقت {target_mention} ونهبت منه **{format_amount(stolen)}** 💵 (1%)\n"
+                f"رصيدك الحالي: **{format_amount(new_balance)}**\n"
+                f"⚠️ {target_mention} انتبه لحسابك، فعّل **حماية** قبل لا يصيدك أحد ثاني!"
+            ),
+            color=SUCCESS_COLOR,
+        )
+    else:
+        balance = get_balance(message.author.id)
+        fine = int(balance * ROB_FAIL_FINE_PERCENT)
+        new_balance = update_balance(message.author.id, -fine)
+        embed = bank_embed(message,
+            title="🚨 لقطوك !",
+            description=(
+                f"حاولت تسرق {target_mention} بس مسكوك متلبس!\n"
+                f"دفعت غرامة **{format_amount(fine)}** 💵\n"
+                f"رصيدك الحالي: **{format_amount(new_balance)}**"
+            ),
+            color=DANGER_COLOR,
+        )
+    await message.reply(embed=embed, mention_author=False)
+
+
+async def bank_cmd_protection(message: discord.Message):
+    remaining = is_protected(message.author.id)
+    if remaining > 0:
+        embed = bank_embed(message,
+            title="🛡️ عندك حماية شغالة",
+            description=f"باقي على انتهائها: **{format_duration(remaining)}**",
+            color=MAIN_COLOR,
+        )
+        return await message.reply(embed=embed, mention_author=False)
+
+    balance = get_balance(message.author.id)
+    if balance < PROTECTION_COST:
+        embed = bank_embed(message,
+            title="❌ رصيدك ما يكفي",
+            description=f"تفعيل الحماية يكلف **{format_amount(PROTECTION_COST)}** 💵",
+            color=DANGER_COLOR,
+        )
+        return await message.reply(embed=embed, mention_author=False)
+
+    new_balance = update_balance(message.author.id, -PROTECTION_COST)
+    set_protection(message.author.id, PROTECTION_HOURS)
+    embed = bank_embed(message,
+        title="🛡️ تم تفعيل الحماية",
+        description=(
+            f"محمي من السرقة لمدة **{PROTECTION_HOURS} ساعات** ⏳\n"
+            f"رصيدك الحالي: **{format_amount(new_balance)}**"
+        ),
+        color=SUCCESS_COLOR,
+    )
+    await message.reply(embed=embed, mention_author=False)
+
+
+# --- رهان / قمار / نرد (ضد البنك) ---
+GAMBLE_OUTCOMES = [(0.0, 20), (0.5, 20), (1.5, 25), (2.0, 20), (3.0, 10), (5.0, 5)]
+
+
+async def bank_cmd_bet(message: discord.Message, arg: str | None):
+    if not await _check_cooldown(message, "رهان"):
+        return
+    balance = get_balance(message.author.id)
+    amount = parse_amount_arg(arg, balance)
+    if amount is None:
+        return await message.reply(embed=_ask_amount_embed(message, "رهان"), mention_author=False)
+    if amount < BET_MIN_BET:
+        return await message.reply(embed=_min_bet_embed(message, BET_MIN_BET), mention_author=False)
+    if amount > balance or amount <= 0:
+        return await message.reply(embed=_not_enough_embed(message, balance), mention_author=False)
+
+    set_cooldown(message.author.id, "رهان")
+    won = random.random() < 0.48
+    delta = amount if won else -amount
+    new_balance = update_balance(message.author.id, delta)
+    embed = bank_embed(message,
+        title="🎯 ربحت الرهان!" if won else "💸 خسرت الرهان",
+        description=(
+            f"{'ربحت' if won else 'خسرت'} **{format_amount(amount)}** 💵\n"
+            f"رصيدك الحالي: **{format_amount(new_balance)}**"
+        ),
+        color=SUCCESS_COLOR if won else DANGER_COLOR,
+    )
+    await message.reply(embed=embed, mention_author=False)
+
+
+async def bank_cmd_gamble(message: discord.Message, arg: str | None):
+    if not await _check_cooldown(message, "قمار"):
+        return
+    balance = get_balance(message.author.id)
+    amount = parse_amount_arg(arg, balance)
+    if amount is None:
+        return await message.reply(embed=_ask_amount_embed(message, "قمار"), mention_author=False)
+    if amount < GAMBLE_MIN_BET:
+        return await message.reply(embed=_min_bet_embed(message, GAMBLE_MIN_BET), mention_author=False)
+    if amount > balance or amount <= 0:
+        return await message.reply(embed=_not_enough_embed(message, balance), mention_author=False)
+
+    set_cooldown(message.author.id, "قمار")
+    multipliers = [m for m, _ in GAMBLE_OUTCOMES]
+    weights = [w for _, w in GAMBLE_OUTCOMES]
+    multiplier = random.choices(multipliers, weights=weights, k=1)[0]
+    profit = int(amount * multiplier) - amount
+    new_balance = update_balance(message.author.id, profit)
+    won = profit >= 0
+    embed = bank_embed(message,
+        title="🎰 ربحت بالقمار!" if won else "🎰 خسرت بالقمار",
+        description=(
+            f"المضاعف: **x{multiplier}**\n"
+            f"{'ربحت' if won else 'خسرت'} **{format_amount(abs(profit))}** 💵\n"
+            f"رصيدك الحالي: **{format_amount(new_balance)}**"
+        ),
+        color=SUCCESS_COLOR if won else DANGER_COLOR,
+    )
+    await message.reply(embed=embed, mention_author=False)
+
+
+async def bank_cmd_dice(message: discord.Message, arg: str | None):
+    if not await _check_cooldown(message, "نرد"):
+        return
+    balance = get_balance(message.author.id)
+    amount = parse_amount_arg(arg, balance)
+    if amount is None:
+        return await message.reply(embed=_ask_amount_embed(message, "نرد"), mention_author=False)
+    if amount < DICE_MIN_BET:
+        return await message.reply(embed=_min_bet_embed(message, DICE_MIN_BET), mention_author=False)
+    if amount > balance or amount <= 0:
+        return await message.reply(embed=_not_enough_embed(message, balance), mention_author=False)
+
+    set_cooldown(message.author.id, "نرد")
+    player_roll = random.randint(1, 6)
+    house_roll = random.randint(1, 6)
+    if player_roll > house_roll:
+        delta, result_text, color = amount, "فزت عليّ! 🎉", SUCCESS_COLOR
+    elif player_roll < house_roll:
+        delta, result_text, color = -amount, "فزت عليك! 😈", DANGER_COLOR
+    else:
+        delta, result_text, color = 0, "تعادل - رجع لك مبلغك بدون ربح أو خسارة", MAIN_COLOR
+    new_balance = update_balance(message.author.id, delta)
+    embed = bank_embed(message,
+        title="🎲 نرد ضد البنك",
+        description=(
+            f"نردك: **🎲{player_roll}** | نرد البنك: **🎲{house_roll}**\n"
+            f"{result_text}\n"
+            f"رصيدك الحالي: **{format_amount(new_balance)}**"
+        ),
+        color=color,
+    )
+    await message.reply(embed=embed, mention_author=False)
+
+
+# --- استثمار / تداول (مع شارت أداء بسيط) ---
+async def bank_cmd_market(message: discord.Message, arg: str | None, game: str):
+    if not await _check_cooldown(message, game):
+        return
+    balance = get_balance(message.author.id)
+    amount = parse_amount_arg(arg, balance)
+    min_bet = INVEST_MIN_BET if game == "استثمار" else TRADE_MIN_BET
+    if amount is None:
+        return await message.reply(embed=_ask_amount_embed(message, game), mention_author=False)
+    if amount < min_bet:
+        return await message.reply(embed=_min_bet_embed(message, min_bet), mention_author=False)
+    if amount > balance or amount <= 0:
+        return await message.reply(embed=_not_enough_embed(message, balance), mention_author=False)
+
+    set_cooldown(message.author.id, game)
+    min_pct, max_pct = (INVEST_MIN_PCT, INVEST_MAX_PCT) if game == "استثمار" else (TRADE_MIN_PCT, TRADE_MAX_PCT)
+    pct = random.uniform(min_pct, max_pct)
+    profit = int(amount * pct)
+    new_balance = update_balance(message.author.id, profit)
+    history = push_bank_history(message.author.id, game, new_balance)
+    won = profit >= 0
+
+    embed = bank_embed(message,
+        title=f"{'📈' if won else '📉'} {game}",
+        description=(
+            f"المبلغ: **{format_amount(amount)}**\n"
+            f"النتيجة: {'ربحت' if won else 'خسرت'} **{format_amount(abs(profit))}** ({pct * 100:+.1f}%)\n"
+            f"رصيدك الحالي: **{format_amount(new_balance)}**"
+        ),
+        color=SUCCESS_COLOR if won else DANGER_COLOR,
+    )
+    try:
+        chart_file = make_growth_chart(history, won)
+        embed.set_image(url="attachment://chart.png")
+        await message.reply(embed=embed, file=chart_file, mention_author=False)
+    except Exception as e:
+        print(f"⚠️ تعذّر رسم شارت {game}: {e}")
+        await message.reply(embed=embed, mention_author=False)
+
+
+# --- ألعاب سريعة بدون كولداون: لعبه / لون / فواكه ---
+MINI_GAME_TITLES = {"لعبه": "🎮 لعبة سريعة", "لون": "🎨 خمن اللون", "فواكه": "🍒 عجلة الفواكه"}
+
+
+async def bank_cmd_minigame(message: discord.Message, name: str):
+    won = random.random() < 0.5
+    amount = random.randint(100, 500) if won else -random.randint(50, 250)
+    new_balance = update_balance(message.author.id, amount)
+    embed = bank_embed(message,
+        title=MINI_GAME_TITLES.get(name, "🎮 لعبة"),
+        description=(
+            f"{'ربحت' if amount >= 0 else 'خسرت'} **{format_amount(abs(amount))}** 💵\n"
+            f"رصيدك الحالي: **{format_amount(new_balance)}**"
+        ),
+        color=SUCCESS_COLOR if amount >= 0 else DANGER_COLOR,
+    )
+    await message.reply(embed=embed, mention_author=False)
+
+
+# --- تسريع (يشيل كل الكولداونات مقابل ذهب) ---
+async def bank_cmd_speedup(message: discord.Message):
+    gold = get_gold(message.author.id)
+    if gold < SPEEDUP_GOLD_COST:
+        embed = bank_embed(message,
+            title="❌ ذهبك ما يكفي",
+            description=f"تحتاج **Gold x{SPEEDUP_GOLD_COST}** لتفعيل التسريع (عندك **{gold}**).",
+            color=DANGER_COLOR,
+        )
+        return await message.reply(embed=embed, mention_author=False)
+
+    new_gold = update_gold(message.author.id, -SPEEDUP_GOLD_COST)
+    clear_cooldowns(message.author.id)
+    embed = bank_embed(message,
+        title="⚡ عملية تسريع",
+        description=(
+            f"تم خصم **Gold x{SPEEDUP_GOLD_COST}** من ممتلكاتك من الذهب\n"
+            f"تم إزالة جميع الأوقات من حسابك ✅\n"
+            f"ذهبك الحالي: **{new_gold}**"
+        ),
+        color=SUCCESS_COLOR,
+    )
+    await message.reply(embed=embed, mention_author=False)
+
+
+# --- المتجر: شراء / بيع ---
+class PropertyBuyView(discord.ui.View):
+    def __init__(self, owner: discord.Member):
+        super().__init__(timeout=120)
+        self.owner = owner
+        for key, info in PROPERTY_CATALOG.items():
+            self.add_item(self._make_buy_button(key, info))
+
+        gold_button = discord.ui.Button(label="🥇 Gold x5 (1000)", style=discord.ButtonStyle.secondary)
+        gold_button.callback = self._buy_gold
+        self.add_item(gold_button)
+
+        stock_button = discord.ui.Button(label=f"📈 سهم ({format_amount(STOCK_PRICE)})", style=discord.ButtonStyle.secondary)
+        stock_button.callback = self._buy_stock
+        self.add_item(stock_button)
+
+    def _make_buy_button(self, key: str, info: dict) -> discord.ui.Button:
+        button = discord.ui.Button(
+            label=f"{info['emoji']} {info['name']} ({format_amount(info['price'])})",
+            style=discord.ButtonStyle.primary,
+        )
+
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.owner.id:
+                return await interaction.response.send_message("❌ هذا مو متجرك!", ephemeral=True)
+            balance = get_balance(interaction.user.id)
+            if balance < info["price"]:
+                return await interaction.response.send_message("❌ رصيدك ما يكفي.", ephemeral=True)
+            new_balance = update_balance(interaction.user.id, -info["price"])
+            count = update_property(interaction.user.id, key, 1)
+            await interaction.response.send_message(
+                f"✅ اشتريت {info['emoji']} {info['name']} (عندك الآن **{count}**)\n"
+                f"رصيدك الحالي: **{format_amount(new_balance)}**",
+                ephemeral=True,
+            )
+
+        button.callback = callback
+        return button
+
+    async def _buy_gold(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner.id:
+            return await interaction.response.send_message("❌ هذا مو متجرك!", ephemeral=True)
+        price = 1000
+        balance = get_balance(interaction.user.id)
+        if balance < price:
+            return await interaction.response.send_message("❌ رصيدك ما يكفي.", ephemeral=True)
+        update_balance(interaction.user.id, -price)
+        new_gold = update_gold(interaction.user.id, 5)
+        await interaction.response.send_message(f"✅ اشتريت Gold x5 (عندك الآن **{new_gold}** ذهب)", ephemeral=True)
+
+    async def _buy_stock(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner.id:
+            return await interaction.response.send_message("❌ هذا مو متجرك!", ephemeral=True)
+        balance = get_balance(interaction.user.id)
+        if balance < STOCK_PRICE:
+            return await interaction.response.send_message("❌ رصيدك ما يكفي.", ephemeral=True)
+        update_balance(interaction.user.id, -STOCK_PRICE)
+        count = update_property(interaction.user.id, "stocks", 1)
+        await interaction.response.send_message(f"✅ اشتريت سهم واحد (عندك الآن **{count}** سهم)", ephemeral=True)
+
+
+class PropertySellView(discord.ui.View):
+    def __init__(self, owner: discord.Member):
+        super().__init__(timeout=120)
+        self.owner = owner
+        for key, info in PROPERTY_CATALOG.items():
+            self.add_item(self._make_sell_button(key, info))
+
+        sell_stock_price = int(STOCK_PRICE * PROPERTY_SELL_RATIO)
+        stock_button = discord.ui.Button(label=f"📉 بيع سهم ({format_amount(sell_stock_price)})", style=discord.ButtonStyle.secondary)
+        stock_button.callback = self._sell_stock
+        self.add_item(stock_button)
+
+    def _make_sell_button(self, key: str, info: dict) -> discord.ui.Button:
+        sell_price = int(info["price"] * PROPERTY_SELL_RATIO)
+        button = discord.ui.Button(
+            label=f"{info['emoji']} بيع {info['name']} ({format_amount(sell_price)})",
+            style=discord.ButtonStyle.danger,
+        )
+
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.owner.id:
+                return await interaction.response.send_message("❌ هذا مو متجرك!", ephemeral=True)
+            props = get_properties(interaction.user.id)
+            if props.get(key, 0) <= 0:
+                return await interaction.response.send_message("❌ ما عندك وحدة من هذي تبيعها.", ephemeral=True)
+            update_property(interaction.user.id, key, -1)
+            new_balance = update_balance(interaction.user.id, sell_price)
+            await interaction.response.send_message(
+                f"✅ بعت {info['emoji']} {info['name']} مقابل **{format_amount(sell_price)}**\n"
+                f"رصيدك الحالي: **{format_amount(new_balance)}**",
+                ephemeral=True,
+            )
+
+        button.callback = callback
+        return button
+
+    async def _sell_stock(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner.id:
+            return await interaction.response.send_message("❌ هذا مو متجرك!", ephemeral=True)
+        props = get_properties(interaction.user.id)
+        if props.get("stocks", 0) <= 0:
+            return await interaction.response.send_message("❌ ما عندك أسهم تبيعها.", ephemeral=True)
+        update_property(interaction.user.id, "stocks", -1)
+        sell_price = int(STOCK_PRICE * PROPERTY_SELL_RATIO)
+        new_balance = update_balance(interaction.user.id, sell_price)
+        await interaction.response.send_message(
+            f"✅ بعت سهم مقابل **{format_amount(sell_price)}**\nرصيدك الحالي: **{format_amount(new_balance)}**",
+            ephemeral=True,
+        )
+
+
+async def bank_cmd_buy(message: discord.Message):
+    view = PropertyBuyView(message.author)
+    embed = bank_embed(message,title="🛒 المتجر - شراء", description="اختر شي تشتريه من الأزرار تحت 👇", color=MAIN_COLOR)
+    await message.reply(embed=embed, view=view, mention_author=False)
+
+
+async def bank_cmd_sell(message: discord.Message):
+    view = PropertySellView(message.author)
+    embed = bank_embed(message,title="💰 المتجر - بيع", description="اختر شي تبيعه من الأزرار تحت 👇", color=MAIN_COLOR)
+    await message.reply(embed=embed, view=view, mention_author=False)
+
+
+# --- ممتلكات / وقت / أغنى ---
+async def bank_cmd_properties(message: discord.Message):
+    props = get_properties(message.author.id)
+    gold = get_gold(message.author.id)
+    worth = net_worth(message.author.id)
+    lines = [f"{info['emoji']} {info['name']}: **{props.get(key, 0)}**" for key, info in PROPERTY_CATALOG.items()]
+    lines.append(f"🥇 ذهب: **{gold}**")
+    lines.append(f"📈 أسهم: **{props.get('stocks', 0)}**")
+    embed = bank_embed(message,title=f"💼 ممتلكات {message.author.display_name}", description="\n".join(lines), color=MAIN_COLOR)
+    embed.add_field(name="💰 إجمالي الثروة", value=f"**{format_amount(worth)}**", inline=False)
+    embed.set_thumbnail(url=message.author.display_avatar.url)
+    await message.reply(embed=embed, mention_author=False)
+
+
+async def bank_cmd_status(message: discord.Message):
+    lines = []
+    for action in BANK_STATUS_ORDER:
+        remaining = get_cooldown_remaining(message.author.id, action)
+        if remaining > 0:
+            lines.append(f"⏳ {action} : باقي {format_duration(remaining)}")
+        else:
+            lines.append(f"🟢 {action} : جاهز للعب")
+    embed = bank_embed(message,title="⏱️ حالة أوامر البنك", description="\n".join(lines), color=MAIN_COLOR)
+    await message.reply(embed=embed, mention_author=False)
+
+
+async def bank_cmd_richest(message: discord.Message):
+    db = load_db()
+    economy = db.get("economy", {})
+    if not economy:
+        embed = bank_embed(message,title="🏆 أغنى الأعضاء", description="ما فيه بيانات كافية بعد.", color=MAIN_COLOR)
+        return await message.reply(embed=embed, mention_author=False)
+
+    ranked = sorted(((uid, net_worth(int(uid))) for uid in economy.keys()), key=lambda kv: kv[1], reverse=True)[:10]
+    lines = []
+    for i, (uid, worth) in enumerate(ranked, start=1):
+        member = message.guild.get_member(int(uid)) if message.guild else None
+        name = member.mention if member else f"<@{uid}>"
+        lines.append(f"#{i} {name} — **{format_amount(worth)}** 💵")
+    embed = bank_embed(message,title="🏆 قائمة أغنى الأعضاء بالسيرفر", description="\n".join(lines), color=WELCOME_COLOR)
+    await message.reply(embed=embed, mention_author=False)
+
+
+async def handle_bank_text_command(message: discord.Message) -> bool:
+    """يفحص هل الرسالة أمر بنك نصي (بدون سلاش)، ولو كذا ينفذه ويرجع True.
+    غير كذا يرجع False فورًا بدون أي تأثير على باقي أنظمة البوت."""
+    content = message.content.strip()
+    if not content:
+        return False
+
+    parts = content.split(maxsplit=1)
+    keyword = parts[0].strip()
+    arg = parts[1].strip() if len(parts) > 1 else None
+
+    if keyword not in BANK_KEYWORDS:
+        return False
+
+    if keyword == "راتب":
+        await bank_cmd_salary(message)
+    elif keyword == "بخشيش":
+        await bank_cmd_tip(message)
+    elif keyword == "حظ":
+        await bank_cmd_luck(message)
+    elif keyword == "روليت":
+        await bank_cmd_roulette(message)
+    elif keyword == "نهب":
+        await bank_cmd_rob(message)
+    elif keyword == "حماية":
+        await bank_cmd_protection(message)
+    elif keyword == "رهان":
+        await bank_cmd_bet(message, arg)
+    elif keyword == "قمار":
+        await bank_cmd_gamble(message, arg)
+    elif keyword == "نرد":
+        await bank_cmd_dice(message, arg)
+    elif keyword in ("استثمار", "تداول"):
+        await bank_cmd_market(message, arg, keyword)
+    elif keyword in ("لعبه", "لون", "فواكه"):
+        await bank_cmd_minigame(message, keyword)
+    elif keyword == "تسريع":
+        await bank_cmd_speedup(message)
+    elif keyword == "بيع":
+        await bank_cmd_sell(message)
+    elif keyword == "شراء":
+        await bank_cmd_buy(message)
+    elif keyword == "ممتلكات":
+        await bank_cmd_properties(message)
+    elif keyword == "وقت":
+        await bank_cmd_status(message)
+    elif keyword == "اغنى":
+        await bank_cmd_richest(message)
+
+    return True
 
 
 # =====================================================================
@@ -2564,9 +3560,11 @@ async def leaderboard(interaction: discord.Interaction):
 @bot.tree.command(name="balance", description="عرض رصيدك الحالي في البنك")
 async def balance(interaction: discord.Interaction):
     bal = get_balance(interaction.user.id)
-    embed = discord.Embed(
+    gold = get_gold(interaction.user.id)
+    embed = bank_embed(
+        interaction,
         title="🏦 رصيدك",
-        description=f"معك حاليًا: **{bal}** عملة",
+        description=f"معك حاليًا: **{format_amount(bal)}** 💵\nذهبك: **{gold}** 🥇",
         color=MAIN_COLOR,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -2580,7 +3578,8 @@ async def mines(interaction: discord.Interaction):
         )
 
     view = MinesGameView(interaction.user)
-    embed = discord.Embed(
+    embed = bank_embed(
+        interaction,
         title="⛏️ لعبة البنك - Mines",
         description=(
             f"اللاعب: {interaction.user.mention}\n"
@@ -2654,11 +3653,6 @@ async def suggestion_panel(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 async def ticket_panel(interaction: discord.Interaction):
     """إرسال لوحة التذاكر الاحترافية مع البنر والعنوان والقائمة."""
-    if not TICKET_TYPES:
-        return await interaction.response.send_message(
-            "❌ ما فيه أي نوع تذكرة مضاف بعد. ضيف نوع واحد على الأقل بالأمر `/ticket_type_add` ثم أعد المحاولة.",
-            ephemeral=True,
-        )
     await send_ticket_panel_message(interaction.channel)
     await interaction.response.send_message("✅ تم إرسال لوحة التذاكر بنجاح.", ephemeral=True)
 
@@ -2738,141 +3732,8 @@ async def set_ticket_role(interaction: discord.Interaction, action: app_commands
         return await interaction.response.send_message(
             "📋 ما فيه قيود حالياً - فتح التذاكر متاح لجميع الأعضاء.", ephemeral=True
         )
-    mentions = " ".join(f"<@&{rid}>" for rid in allowed_roles)
-    return await interaction.response.send_message(f"📋 الرتب المسموح لها فتح تذاكر:\n{mentions}", ephemeral=True)
-
-
-@bot.tree.command(name="set_staff_role", description="تحديد رتب الإدارة اللي تقدر تشوف وتستلم وتغلق التذاكر - للإدارة فقط")
-@app_commands.describe(action="نوع العملية", role="الرتبة (مطلوبة مع إضافة/إزالة)")
-@app_commands.choices(action=[
-    app_commands.Choice(name="➕ إضافة رتبة", value="add"),
-    app_commands.Choice(name="➖ إزالة رتبة", value="remove"),
-    app_commands.Choice(name="📋 عرض القائمة الحالية", value="list"),
-])
-@app_commands.checks.has_permissions(administrator=True)
-async def set_staff_role(interaction: discord.Interaction, action: app_commands.Choice[str], role: discord.Role = None):
-    db = load_db()
-    staff_roles = db["settings"].setdefault("staff_role_ids", [])
-
-    if action.value == "add":
-        if not role:
-            return await interaction.response.send_message("❌ لازم تحدد رتبة مع خيار الإضافة.", ephemeral=True)
-        if role.id not in staff_roles:
-            staff_roles.append(role.id)
-            save_db(db)
-        if role.id not in STAFF_ROLE_IDS:
-            STAFF_ROLE_IDS.append(role.id)
-        return await interaction.response.send_message(
-            f"✅ صارت رتبة {role.mention} تقدر تشوف وتستلم وتغلق التذاكر فوراً.", ephemeral=True
-        )
-
-    if action.value == "remove":
-        if not role:
-            return await interaction.response.send_message("❌ لازم تحدد رتبة مع خيار الإزالة.", ephemeral=True)
-        if role.id in staff_roles:
-            staff_roles.remove(role.id)
-            save_db(db)
-        if role.id in STAFF_ROLE_IDS:
-            STAFF_ROLE_IDS.remove(role.id)
-        return await interaction.response.send_message(
-            f"✅ تم سحب صلاحية إدارة التذاكر من رتبة {role.mention}.\n"
-            "⚠️ ملاحظة: لو هالرتبة كانت مضبوطة أصلاً بملف .env (STAFF_ROLE_IDS)، بترجع تلقائياً عند إعادة تشغيل البوت "
-            "- لازم تشيلها من هناك كمان لو تبيها تنحذف نهائياً.",
-            ephemeral=True,
-        )
-
-    # action.value == "list"
-    combined = sorted(set(STAFF_ROLE_IDS))
-    if not combined:
-        return await interaction.response.send_message(
-            "📋 ما فيه رتب إدارة تذاكر مضبوطة حالياً.", ephemeral=True
-        )
-    mentions = " ".join(f"<@&{rid}>" for rid in combined)
-    return await interaction.response.send_message(f"📋 رتب إدارة التذاكر الحالية:\n{mentions}", ephemeral=True)
-
-
-# =====================================================================
-#           🎫  إدارة أنواع التذاكر (إضافة/حذف) من ديسكورد مباشرة
-# =====================================================================
-async def ticket_type_autocomplete(interaction: discord.Interaction, current: str):
-    return [
-        app_commands.Choice(name=f"{v['emoji']} {v['label']} ({k})", value=k)
-        for k, v in TICKET_TYPES.items()
-        if current.lower() in k.lower() or current.lower() in v["label"].lower()
-    ][:25]
-
-
-@bot.tree.command(name="ticket_type_add", description="إضافة نوع تذكرة جديد (زي: شراء، شكوى...) يظهر بقائمة فتح التذاكر - للإدارة فقط")
-@app_commands.describe(
-    key="مفتاح داخلي بالإنجليزي بدون مسافات (مثال: purchase)",
-    label="الاسم اللي يظهر للأعضاء (مثال: شراء)",
-    emoji="إيموجي يمثل النوع (مثال: 💰)",
-    description="وصف قصير يظهر تحت الاسم بالقائمة",
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def ticket_type_add(interaction: discord.Interaction, key: str, label: str, emoji: str, description: str):
-    key = key.strip().lower().replace(" ", "_")
-    if not key:
-        return await interaction.response.send_message("❌ المفتاح ما يصير فاضي.", ephemeral=True)
-
-    is_first_type = len(TICKET_TYPES) == 0
-
-    db = load_db()
-    custom_types = db["settings"].setdefault("custom_ticket_types", {})
-    custom_types[key] = {"label": label, "emoji": emoji, "description": description}
-    # لو كان هالمفتاح ضمن قائمة المحذوفة سابقاً، نرجعه
-    removed = db["settings"].setdefault("removed_ticket_types", [])
-    if key in removed:
-        removed.remove(key)
-    save_db(db)
-
-    TICKET_TYPES[key] = {"label": label, "emoji": emoji, "description": description}
-
-    note = "📌 أرسل `/ticket_panel` من جديد بروم التذاكر عشان النوع الجديد يظهر بالقائمة."
-    if is_first_type:
-        note = (
-            "⚠️ هذا أول نوع تذكرة تضيفه - لازم تعيد تشغيل البوت مرة وحدة الآن عشان لوحة التذاكر تشتغل، "
-            "وبعدها استخدم `/ticket_panel` عادي بدون ما تحتاج تعيد التشغيل مرة ثانية."
-        )
-
-    await interaction.response.send_message(
-        f"✅ تم إضافة نوع التذكرة {emoji} **{label}**.\n{note}",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="ticket_type_remove", description="حذف نوع تذكرة موجود (افتراضي أو مضاف) - للإدارة فقط")
-@app_commands.describe(key="نوع التذكرة اللي تبي تحذفه")
-@app_commands.autocomplete(key=ticket_type_autocomplete)
-@app_commands.checks.has_permissions(administrator=True)
-async def ticket_type_remove(interaction: discord.Interaction, key: str):
-    if key not in TICKET_TYPES:
-        return await interaction.response.send_message("❌ هذا النوع مو موجود أصلاً.", ephemeral=True)
-    if len(TICKET_TYPES) <= 1:
-        return await interaction.response.send_message("❌ ما تقدر تحذف آخر نوع متبقي - لازم يبقى نوع واحد على الأقل.", ephemeral=True)
-
-    label = TICKET_TYPES[key]["label"]
-    db = load_db()
-    db["settings"].setdefault("custom_ticket_types", {}).pop(key, None)
-    removed = db["settings"].setdefault("removed_ticket_types", [])
-    if key not in removed:
-        removed.append(key)
-    save_db(db)
-
-    TICKET_TYPES.pop(key, None)
-
-    await interaction.response.send_message(
-        f"✅ تم حذف نوع التذكرة **{label}**.\n"
-        "📌 أرسل `/ticket_panel` من جديد بروم التذاكر عشان التغيير يظهر بالقائمة.",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="ticket_types_list", description="عرض كل أنواع التذاكر الحالية ومفاتيحها - للإدارة فقط")
-@app_commands.checks.has_permissions(administrator=True)
-async def ticket_types_list(interaction: discord.Interaction):
-    lines = [f"{v['emoji']} **{v['label']}** — مفتاحها: `{k}`" for k, v in TICKET_TYPES.items()]
-    await interaction.response.send_message("📋 أنواع التذاكر الحالية:\n" + "\n".join(lines), ephemeral=True)
+    mentions = "\n".join(f"• <@&{rid}>" for rid in allowed_roles)
+    await interaction.response.send_message(f"📋 الرتب المسموح لها فتح تذاكر حالياً:\n{mentions}", ephemeral=True)
 
 
 @bot.tree.command(name="voice_join", description="يخلي البوت يدخل ويقعد بروم صوتي معين ويبدأ يحسب وقته فيه - للأونر والإدارة العليا بس")
