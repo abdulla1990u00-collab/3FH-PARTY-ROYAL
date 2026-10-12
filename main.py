@@ -1737,6 +1737,12 @@ async def bank_market_updater():
 
 @bot.event
 async def on_ready():
+    # جهّز خط عربي حقيقي قبل عرض أي بطاقة بنك حتى لا تظهر الحروف كمربعات.
+    try:
+        await ensure_arabic_font()
+    except Exception as font_exc:
+        print(f"⚠️ [البنك] تعذّر تجهيز الخط العربي عند التشغيل: {font_exc}")
+
     if not bank_market_updater.is_running():
         bank_market_updater.start()
 
@@ -2218,6 +2224,10 @@ def _resolve_font_paths() -> dict:
 
 
 _FONT_DOWNLOAD_URLS = [
+    # raw.githubusercontent.com يقلّل مشاكل التحويل/إعادة التوجيه في بعض بيئات الاستضافة.
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/lalezar/Lalezar-Regular.ttf",
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/tajawal/Tajawal%5Bwght%5D.ttf",
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/cairo/Cairo%5Bslnt%2Cwght%5D.ttf",
     "https://github.com/google/fonts/raw/main/ofl/lalezar/Lalezar-Regular.ttf",
     "https://github.com/google/fonts/raw/main/ofl/tajawal/Tajawal-Bold.ttf",
     "https://github.com/google/fonts/raw/main/ofl/cairo/Cairo%5Bslnt%2Cwght%5D.ttf",
@@ -2772,7 +2782,7 @@ def get_job_title(member) -> str:
     return "عامل"
 
 
-def render_roulette_wheel(prize_labels: list[str], winning_index: int, avatar_bytes: bytes | None = None) -> discord.File:
+def render_roulette_wheel(prize_labels: list[str], winning_index: int, avatar_bytes: bytes | None = None, result_text: str | None = None) -> discord.File:
     """يرسم عجلة روليت متحركة فعليًا (تدور قدامك وتوقف بالتدريج على القطاع الفائز) بثيم ذهبي/داكن."""
     size = 640
     center = size // 2
@@ -2833,6 +2843,18 @@ def render_roulette_wheel(prize_labels: list[str], winning_index: int, avatar_by
                 (center - avatar_size // 2, center - avatar_size // 2, center + avatar_size // 2, center + avatar_size // 2),
                 outline=(241, 196, 15, 255), width=4,
             )
+        # نكتب نتيجة الجولة داخل نفس الـ GIF بدل إرسال بطاقة ثانية منفصلة.
+        if result_text:
+            draw.rounded_rectangle((24, size - 86, size - 24, size - 18), radius=18, fill=(35, 25, 15, 238), outline=(241, 196, 15, 255), width=3)
+            result_font = _font_for(result_text, 23)
+            shown = _prep(result_text)
+            bbox = draw.textbbox((0, 0), shown, font=result_font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if tw > size - 72:
+                result_font = _font_for(result_text, 18)
+                bbox = draw.textbbox((0, 0), shown, font=result_font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text(((size - tw) / 2, size - 52 - th / 2), shown, font=result_font, fill=(255, 255, 255, 255))
         return image.convert("RGB")
 
     frame_count = 22
@@ -3160,9 +3182,10 @@ async def bank_cmd_roulette(message: discord.Message):
 
     try:
         avatar_bytes = await message.author.display_avatar.read()
-        wheel_file = render_roulette_wheel(labels, winning_index, avatar_bytes)
-        embed.set_image(url="attachment://roulette.gif")
-        await send_bank_reply(message, embed=embed, file=wheel_file, mention_author=False)
+        result_line = f"النتيجة: {format_amount(prize)}" if not (isinstance(prize, str) and prize.startswith("gold:")) else f"النتيجة: ذهب x{amount}"
+        wheel_file = render_roulette_wheel(labels, winning_index, avatar_bytes, result_text=result_line)
+        # إرسال GIF واحد فقط؛ النتيجة مكتوبة داخله لتجنب ظهور صورتين منفصلتين.
+        await message.reply(file=wheel_file, mention_author=False)
     except Exception as e:
         print(f"⚠️ تعذّر رسم عجلة الروليت: {e}")
         await send_bank_reply(message, embed=embed, mention_author=False)
@@ -3376,13 +3399,30 @@ async def bank_cmd_market(message: discord.Message, arg: str | None, game: str):
         color=SUCCESS_COLOR if won else DANGER_COLOR,
     )
     try:
-        avatar_bytes = await message.author.display_avatar.read()
-        delta_label = f"+{round(pct * 100)}" if won else f"{round(pct * 100)}"
-        chart_file = make_growth_chart(history, won, avatar_bytes=avatar_bytes, delta_label=delta_label)
-        embed.set_image(url="attachment://chart.png")
-        await send_bank_reply(message, embed=embed, file=chart_file, mention_author=False)
+        # بطاقة واحدة فقط: ندمج معلومات الربح/الخسارة والسهم والشارت داخل نفس صورة البنك.
+        avatar_bytes = await _bank_avatar_bytes(message.author)
+        delta_label = f"+{round(pct * 100)}%" if won else f"{round(pct * 100)}%"
+        card_text = (
+            f"المبلغ: {format_amount(amount)}\n"
+            f"{'ربحت' if won else 'خسرت'}: {format_amount(abs(profit))}\n"
+            f"نسبة التغيير: {pct * 100:+.1f}%\n"
+            f"رصيدك الحالي: {format_amount(new_balance)}"
+        )
+        card_buffer = await asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                _render_card_sync,
+                avatar_bytes,
+                message.author.display_name,
+                f"{'📈' if won else '📉'} {game}",
+                card_text,
+                chart={"values": history, "up": won, "tag": delta_label, "pct_text": delta_label},
+                icon="chart_up" if won else "chart_down",
+            ),
+        )
+        await message.reply(file=discord.File(card_buffer, filename="bank-market-result.png"), mention_author=False)
     except Exception as e:
-        print(f"⚠️ تعذّر رسم شارت {game}: {e}")
+        print(f"⚠️ تعذّر رسم بطاقة نتيجة {game}: {e}")
         await send_bank_reply(message, embed=embed, mention_author=False)
 
 
