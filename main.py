@@ -641,20 +641,13 @@ def build_ticket_embed(ticket_number: str, ticket_type_key: str, opener: discord
     embed = discord.Embed(
         title=f"{t['emoji']} تذكرة #{ticket_number} - {t['label']}",
         description=(
-            "مرحبًا بك في تذكرة إدارة **3FH PARTY ROYAL**! 👋\n\n"
-            "يسعدنا مساعدتك، يرجى توضيح سبب فتح التذكرة بشكل واضح ومختصر، "
-            "مع إرفاق أي صور أو مقاطع أو أدلة إن وجدت.\n\n"
-            "**يرجى تضمين المعلومات التالية:**\n"
-            "📌 اسمك داخل اللعبة\n"
-            "📎 سبب فتح التذكرة\n"
-            "📎 أي أدلة أو معلومات إضافية تساعد الإدارة على مراجعة طلبك\n\n"
-            "**⚠️ يرجى الالتزام بالتالي:**\n"
-            "• عدم عمل منشن للإدارة أو إرسال رسائل متكررة\n"
-            "• عدم فتح أكثر من تذكرة لنفس الموضوع\n"
-            "• التحلي بالاحترام أثناء التواصل\n"
-            "• استخدام التذكرة للغرض المخصص لها فقط\n\n"
-            "⏳ سيتم مراجعة طلبك والرد عليك من قبل أحد أفراد الإدارة في أقرب وقت ممكن.\n\n"
-            "شكرًا لتعاونك، ونتمنى لك تجربة ممتعة في **3FH PARTY ROYAL** 💙"
+            "🔔 **تذكرة جديدة بانتظار الإدارة**\n"
+            "راجعوا بيانات العضو والأدلة المرفقة أدناه، ثم استلموا التذكرة قبل الرد عليه.\n\n"
+            "**خطوات التعامل:**\n"
+            "1️⃣ اضغطوا **استلام التذكرة** عشان يعرف الجميع إن فيه مسؤول عنها\n"
+            "2️⃣ راجعوا السبب والأدلة وردوا على العضو داخل الروم\n"
+            "3️⃣ بعد الحل اضغطوا **إغلاق التذكرة**، وبيُحفظ سجل المحادثة وينرسل للعضو تقييم\n\n"
+            "⏳ العضو بانتظار الرد، يرجى الاستعجال بقدر الإمكان."
         ),
         color=MAIN_COLOR,
         timestamp=datetime.now(timezone.utc),
@@ -676,6 +669,19 @@ def build_ticket_embed(ticket_number: str, ticket_type_key: str, opener: discord
     # نخزن رقم التذكرة داخل الفوتر حتى نتمكن من قراءته لاحقاً (بعد إعادة التشغيل مثلاً)
     embed.set_footer(text=f"ticket:{ticket_number}")
     return embed
+
+
+def build_ticket_welcome(opener: discord.Member) -> discord.Embed:
+    """رسالة ترحيب قصيرة موجهة لصاحب التذكرة (معلومات الإدارة بالرسالة الثانية)."""
+    return discord.Embed(
+        title="👋 أهلاً بك في تذكرتك",
+        description=(
+            f"{opener.mention} تم استلام طلبك، وبيرد عليك أحد أفراد الإدارة بأقرب وقت ⏳\n\n"
+            "📎 تقدر تكتب هنا أي أدلة أو صور أو مقاطع إضافية.\n"
+            "⚠️ بدون منشن للإدارة أو رسائل متكررة، ونلتزم بالاحترام."
+        ),
+        color=MAIN_COLOR,
+    )
 
 
 # =====================================================================
@@ -1034,11 +1040,13 @@ async def create_ticket(interaction: discord.Interaction, ticket_type_key: str, 
         if extra_info:
             for field_name, field_value in extra_info.items():
                 embed.add_field(name=f"📌 {field_name}", value=field_value, inline=False)
-        mention_line = f"{user.mention} {' '.join(staff_mentions)}"
+        # 1) ترحيب قصير للعضو  2) رسالة المعلومات + الأزرار موجهة للإدارة
+        await channel.send(content=user.mention, embed=build_ticket_welcome(user))
+        staff_line = " ".join(staff_mentions) if staff_mentions else None
         if banner_file:
-            await channel.send(content=mention_line, embed=embed, view=TicketControlView(), file=banner_file)
+            await channel.send(content=staff_line, embed=embed, view=TicketControlView(), file=banner_file)
         else:
-            await channel.send(content=mention_line, embed=embed, view=TicketControlView())
+            await channel.send(content=staff_line, embed=embed, view=TicketControlView())
 
         # تنبيه لصاحب التذكرة إذا محد من الإدارة متواجد أونلاين حالياً
         if STAFF_ROLE_IDS and not any_staff_available(guild):
@@ -3220,6 +3228,8 @@ BANK_TEXT_TRIGGERS = {
 
 def _norm_word(w: str) -> str:
     w = w.strip().lower()
+    for a, b in (("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"), ("ى", "ي"), ("ؤ", "و"), ("ئ", "ي")):
+        w = w.replace(a, b)
     return w[2:] if w.startswith("ال") and len(w) > 3 else w
 
 
@@ -4792,6 +4802,9 @@ class PropertyBuyView(discord.ui.View):
         s = discord.ui.Button(label=f"📈 سهم ({STOCK_PRICE:,})", style=discord.ButtonStyle.secondary)
         s.callback = self._stock
         self.add_item(s)
+        sel = _market_select("buy", owner.id)
+        if sel:
+            self.add_item(sel)
 
     async def _guard(self, interaction):
         if interaction.user.id != self.owner.id:
@@ -4844,6 +4857,9 @@ class PropertySellView(discord.ui.View):
         s = discord.ui.Button(label=f"📉 بيع سهم ({int(STOCK_PRICE * PROPERTY_SELL_RATIO):,})", style=discord.ButtonStyle.secondary)
         s.callback = self._stock
         self.add_item(s)
+        sel = _market_select("sell", owner.id)
+        if sel:
+            self.add_item(sel)
 
     async def _guard(self, interaction):
         if interaction.user.id != self.owner.id:
@@ -4875,6 +4891,69 @@ class PropertySellView(discord.ui.View):
         await _shop_reply(interaction, "عملية بيع ناجحة", "بعت : سهم", _signed(price), f"رصيدك الحالي : {fmt_money(nb)}", "coins")
 
 
+class MarketAmountModal(discord.ui.Modal):
+    """نافذة إدخال المبلغ لشراء/بيع أي أصل من السوق العالمي (ذهب، فضة، نفط، بتكوين، أسهم...)."""
+
+    def __init__(self, mode: str, key: str):
+        super().__init__(title=f"{'شراء' if mode == 'buy' else 'بيع'} {ASSETS[key]['name']}"[:45])
+        self.mode, self.key = mode, key
+        self.amount = discord.ui.TextInput(
+            label="المبلغ بالدولار (رقم / نص / كامل)" if mode == "buy" else "المبلغ بالدولار (فاضي = بيع الكل)",
+            placeholder="مثال: 5000", required=(mode == "buy"), max_length=15,
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        raw = (self.amount.value or "").strip()
+        user = interaction.user
+        if self.mode == "buy":
+            amt = parse_amount_ctx([raw], user.id)
+            if not amt:
+                return await interaction.followup.send("❌ اكتب مبلغ صحيح (رقم أو نص أو كامل).", ephemeral=True)
+            err, res = await act_buy(user, self.key, amt)
+        else:
+            amt = None if (not raw or raw in ("كامل", "الكل", "كل")) else parse_amount(raw)
+            if raw and amt is None and raw not in ("كامل", "الكل", "كل"):
+                return await interaction.followup.send("❌ اكتب مبلغ صحيح أو اتركه فاضي لبيع الكل.", ephemeral=True)
+            err, res = await act_sell(user, self.key, amt)
+        if err:
+            return await interaction.followup.send(err, ephemeral=True)
+        text, file = res
+        await interaction.followup.send(content=text, file=file, ephemeral=True) if file else await interaction.followup.send(content=text, ephemeral=True)
+
+
+def _market_select(mode: str, owner_id: int, row: int = 3):
+    """قائمة منسدلة بأصول السوق (شراء: كل الأصول | بيع: اللي عند اللاعب بس)."""
+    db = load_db()
+    m = ensure_market(db)
+    if mode == "buy":
+        keys = list(ASSETS)
+    else:
+        keys = [k for k, p in db["portfolio"].get(str(owner_id), {}).items() if k in ASSETS and p.get("units", 0) > 0]
+    if not keys:
+        return None
+    options = []
+    for k in keys[:25]:
+        if mode == "buy":
+            desc = f"السعر الحالي: {fmt_price(m['prices'][k])}"
+        else:
+            desc = f"قيمتها الحين: {fmt_money(db['portfolio'][str(owner_id)][k]['units'] * m['prices'][k])}"
+        options.append(discord.SelectOption(label=ASSETS[k]["name"], value=k, description=desc[:100]))
+    sel = discord.ui.Select(
+        placeholder="📊 اشترِ من السوق العالمي (ذهب، فضة، نفط، بتكوين...)" if mode == "buy" else "📉 بيع من استثماراتك بالسوق",
+        options=options, min_values=1, max_values=1, row=row,
+    )
+
+    async def cb(interaction: discord.Interaction):
+        if interaction.user.id != owner_id:
+            return await interaction.response.send_message("❌ هذا مو متجرك!", ephemeral=True)
+        await interaction.response.send_modal(MarketAmountModal(mode, sel.values[0]))
+
+    sel.callback = cb
+    return sel
+
+
 async def cmd_shop(message: discord.Message, sell: bool):
     user = message.author
     props = get_properties(user.id)
@@ -4888,7 +4967,7 @@ async def cmd_shop(message: discord.Message, sell: bool):
         rows.append((f"Gold x{GOLD_PACK_AMOUNT}", fmt_money(GOLD_PACK_PRICE), f"عندك {get_gold(user.id)}", None))
         rows.append(("سهم", fmt_money(STOCK_PRICE), f"عندك {props.get('stocks', 0)}", None))
     buf = await _run_sync(_render_table_sync, "المتجر - بيع" if sell else "المتجر - شراء",
-                          ["الصنف", "سعر البيع" if sell else "السعر", "ممتلكاتك"], rows, "اختر من الأزرار تحت", "gold")
+                          ["الصنف", "سعر البيع" if sell else "السعر", "ممتلكاتك"], rows, "اختر من الأزرار، أو من قائمة السوق العالمي تحت (ذهب، فضة، نفط، بتكوين...)", "gold")
     view = PropertySellView(user) if sell else PropertyBuyView(user)
     await message.reply(content=f"🛒 {user.mention}", file=discord.File(buf, filename="shop.png"), view=view, mention_author=False)
 
