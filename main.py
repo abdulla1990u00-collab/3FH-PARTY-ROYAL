@@ -158,6 +158,7 @@ PROPERTY_CATALOG = {
 PROPERTY_SELL_RATIO = 0.6
 STOCK_PRICE = 500
 GOLD_PACK_PRICE, GOLD_PACK_AMOUNT = 1000, 5
+GOLD_UNIT_PRICE = GOLD_PACK_PRICE // GOLD_PACK_AMOUNT      # سعر الـ Gold الواحد = 200$
 GAMBLE_OUTCOMES = [(0.0, 20), (0.5, 20), (1.5, 25), (2.0, 20), (3.0, 10), (5.0, 5)]
 COLOR_MAX_ATTEMPTS = 25
 COLOR_RESET_HOURS = 24
@@ -270,6 +271,7 @@ def load_db() -> dict:
     data.setdefault("properties", {})
     data.setdefault("color_game", {})
     data.setdefault("bank_history", {})
+    data.setdefault("mafia", {})
     data.setdefault("dm_broadcast_progress", None)
     return data
 
@@ -1526,6 +1528,7 @@ class ControlPanelView(discord.ui.View):
 async def on_ready():
     # تسجيل الفيوهات الدائمة حتى تعمل الأزرار بعد إعادة تشغيل البوت
     bot.add_view(TicketPanelView())
+    bot.add_view(MafiaPanelView())
     bot.add_view(TicketControlView())
     bot.add_view(SuggestionView())
     bot.add_view(SuggestionPanelView())
@@ -1725,6 +1728,8 @@ async def on_message(message: discord.Message):
 
     # أوامر البنك النصية (فلوس / تحويل / نرد / سوق ...) - تشتغل بس بروم البنك
     if await handle_text_commands(message):
+        return
+    if await handle_mafia_text(message):
         return
     if await handle_bank_text(message):
         return
@@ -2954,9 +2959,24 @@ async def market_updater():
 # =====================================================================
 #                      🧮  أدوات تنسيق + صور البنك
 # =====================================================================
+_MONEY_UNITS = [(10 ** 15, "Qa"), (10 ** 12, "T"), (10 ** 9, "B"), (10 ** 6, "M")]
+
+
 def fmt_money(n) -> str:
+    """أقل من مليون: رقم كامل بفواصل | من المليون وفوق: رقم مختصر بحرف جنبه (1.25M / 3.4B / 2T)."""
     n = int(round(n))
-    return f"-${abs(n):,}" if n < 0 else f"${n:,}"
+    sign, a = ("-" if n < 0 else ""), abs(n)
+    if a < 10 ** 6:
+        return f"{sign}${a:,}"
+    for i, (size, tag) in enumerate(_MONEY_UNITS):
+        if a >= size:
+            v = round(a / size, 2)
+            if v >= 1000 and i > 0:                       # 999,999,999 يتقرب لـ 1B مو 1000M
+                size, tag = _MONEY_UNITS[i - 1]
+                v = round(a / size, 2)
+            txt = f"{v:,.2f}".rstrip("0").rstrip(".")
+            return f"{sign}${txt}{tag}"
+    return f"{sign}${a:,}"
 
 
 def fmt_price(p: float) -> str:
@@ -3296,6 +3316,9 @@ async def handle_bank_text(message: discord.Message) -> bool:
                     if err:
                         clear_cooldown(author.id, "نرد")    # العملية فشلت (رصيد/رهان) = ما نحسب عليه انتظار
             elif action in ("buy", "sell"):
+                if action == "buy" and any(_norm_word(w) in ("جولد", "جولدات") for w in rest):
+                    nums = [w for w in rest if _norm_word(w) not in ("جولد", "جولدات")]
+                    return await handle_extra_bank(message, "جولد", nums)
                 key = find_asset_key(rest)
                 if not key:
                     await cmd_shop(message, sell=(action == "sell"))     # بدون اسم أصل = متجر الممتلكات
@@ -4553,7 +4576,7 @@ BANK_HELP_LINES = [
     ("روليت", "روليت كازينو متحرك بجوائز كاش وذهب"), ("نهب", "اسرق أغنى عضو غير محمي"), ("حماية", "حماية 5 ساعات من السرقة"),
     ("رهان / قمار / نرد + مبلغ", "العب ضد البنك (نص / كامل / رقم)"), ("استثمار / تداول + مبلغ", "مخاطرة + شارت أداء"),
     ("الغام [مبلغ]", "ألغام بمضاعف حقيقي (مجاني أو برهان)"), ("لعبه", "حجرة ورقة مقص"), ("فواكه", "ماكينة فواكه متحركة"),
-    ("لون", "أي لون أكثر بالشبكة؟ (25 محاولة يومياً)"), ("تسريع", f"يشيل الانتظار مقابل Gold x{SPEEDUP_GOLD_COST}"),
+    ("لون", "أي لون أكثر بالشبكة؟ (25 محاولة يومياً)"), ("تسريع / جولد 30", f"تسريع = Gold x{SPEEDUP_GOLD_COST} | جولد + عدد = اشتري كم تبغى"),
     ("شراء / بيع", "متجر الممتلكات (أو: شراء ذهب 500 للسوق)"), ("سوق / حصالتي", "أسعار السوق ومحفظتك"),
     ("ممتلكات", "ممتلكاتك وثروتك"), ("اغنى", "أغنى 10 أعضاء"), ("فلوس / تحويل", "رصيدك وتحويل الفلوس"), ("وقت", "جاهزية كل الأوامر"),
 ]
@@ -4788,6 +4811,41 @@ async def _shop_reply(interaction, title, main, amount, side, icon="coins"):
     await interaction.followup.send(file=f, ephemeral=True)
 
 
+async def act_buy_gold(user, count):
+    """شراء Gold (عملة التسريع) بالعدد اللي يحدده اللاعب."""
+    if not count or count < 1:
+        return "❌ حدد كم Gold تبغى، مثال: `جولد 30` (السعر " + fmt_money(GOLD_UNIT_PRICE) + " للواحد).", None
+    cost = count * GOLD_UNIT_PRICE
+    bal = get_balance(user.id)
+    if cost > bal:
+        return f"❌ رصيدك ما يكفي! Gold x{count} تكلف **{fmt_money(cost)}** ومعك {fmt_money(bal)} بس.", None
+    nb = update_balance(user.id, -cost)
+    ng = update_gold(user.id, count)
+    f = await make_card(user, "عملية شراء ناجحة", f"اشتريت : Gold x{count} (عندك الآن {ng})", amount=_signed(-cost),
+                        side=f"رصيدك الحالي : {fmt_money(nb)}", icon="gold")
+    return None, (f"🥇 {user.mention}", f)
+
+
+class GoldAmountModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="شراء Gold")
+        self.amount = discord.ui.TextInput(label=f"كم Gold تبغى؟ (الواحد {GOLD_UNIT_PRICE}$)", placeholder="مثال: 30", required=True, max_length=9)
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        raw = (self.amount.value or "").strip()
+        if raw in ("كامل", "الكل", "كل"):
+            count = get_balance(interaction.user.id) // GOLD_UNIT_PRICE
+        else:
+            count = parse_amount(raw)
+        err, res = await act_buy_gold(interaction.user, count)
+        if err:
+            return await interaction.followup.send(err, ephemeral=True)
+        text, file = res
+        await interaction.followup.send(content=text, file=file, ephemeral=True)
+
+
 class PropertyBuyView(discord.ui.View):
     def __init__(self, owner):
         super().__init__(timeout=120)
@@ -4796,7 +4854,7 @@ class PropertyBuyView(discord.ui.View):
             b = discord.ui.Button(label=f"{info['emoji']} {info['name']} ({info['price']:,})", style=discord.ButtonStyle.primary)
             b.callback = self._buy(key, info)
             self.add_item(b)
-        g = discord.ui.Button(label=f"🥇 Gold x{GOLD_PACK_AMOUNT} ({GOLD_PACK_PRICE:,})", style=discord.ButtonStyle.secondary)
+        g = discord.ui.Button(label=f"🥇 شراء Gold (الواحد {GOLD_UNIT_PRICE:,})", style=discord.ButtonStyle.secondary)
         g.callback = self._gold
         self.add_item(g)
         s = discord.ui.Button(label=f"📈 سهم ({STOCK_PRICE:,})", style=discord.ButtonStyle.secondary)
@@ -4826,14 +4884,9 @@ class PropertyBuyView(discord.ui.View):
         return cb
 
     async def _gold(self, interaction):
-        if not await self._guard(interaction):
-            return
-        if get_balance(interaction.user.id) < GOLD_PACK_PRICE:
-            return await interaction.followup.send("❌ رصيدك ما يكفي.", ephemeral=True)
-        nb = update_balance(interaction.user.id, -GOLD_PACK_PRICE)
-        ng = update_gold(interaction.user.id, GOLD_PACK_AMOUNT)
-        await _shop_reply(interaction, "عملية شراء ناجحة", f"اشتريت : Gold x{GOLD_PACK_AMOUNT} (عندك {ng})",
-                          _signed(-GOLD_PACK_PRICE), f"رصيدك الحالي : {fmt_money(nb)}", "gold")
+        if interaction.user.id != self.owner.id:
+            return await interaction.response.send_message("❌ هذا مو متجرك!", ephemeral=True)
+        await interaction.response.send_modal(GoldAmountModal())
 
     async def _stock(self, interaction):
         if not await self._guard(interaction):
@@ -4964,7 +5017,7 @@ async def cmd_shop(message: discord.Message, sell: bool):
     if sell:
         rows.append(("سهم", fmt_money(int(STOCK_PRICE * PROPERTY_SELL_RATIO)), f"عندك {props.get('stocks', 0)}", None))
     else:
-        rows.append((f"Gold x{GOLD_PACK_AMOUNT}", fmt_money(GOLD_PACK_PRICE), f"عندك {get_gold(user.id)}", None))
+        rows.append(("Gold (للواحد)", fmt_money(GOLD_UNIT_PRICE), f"عندك {get_gold(user.id)}", None))
         rows.append(("سهم", fmt_money(STOCK_PRICE), f"عندك {props.get('stocks', 0)}", None))
     buf = await _run_sync(_render_table_sync, "المتجر - بيع" if sell else "المتجر - شراء",
                           ["الصنف", "سعر البيع" if sell else "السعر", "ممتلكاتك"], rows, "اختر من الأزرار، أو من قائمة السوق العالمي تحت (ذهب، فضة، نفط، بتكوين...)", "gold")
@@ -5130,7 +5183,7 @@ EXTRA_BANK_ACTIONS = {
     "نهب": ("rob", "نهب"), "حماية": ("protection", None), "رهان": ("bet", "رهان"), "قمار": ("gamble", "قمار"),
     "استثمار": ("invest", "استثمار"), "تداول": ("invest", "تداول"), "لعبه": ("rps", None), "لعبة": ("rps", None),
     "فواكه": ("fruits", None), "لون": ("colors", None), "تسريع": ("speedup", None),
-    "ممتلكات": ("properties", None), "اغنى": ("richest", None), "أغنى": ("richest", None),
+    "جولد": ("buygold", None), "ممتلكات": ("properties", None), "اغنى": ("richest", None), "أغنى": ("richest", None),
     "اوامر": ("help", None), "أوامر": ("help", None),
 }
 _ACT_FUNCS = {
@@ -5167,6 +5220,15 @@ async def handle_extra_bank(message: discord.Message, word: str, rest: list) -> 
             if action == "colors":
                 await cmd_colors(message)
                 return True
+            if action == "buygold":
+                if rest and rest[0] in ("كامل", "الكل", "كل", "نص", "نصف", "ربع"):
+                    amount = (amount or 0) // GOLD_UNIT_PRICE       # الكلمات هنا تعني نسبة من رصيدك بالدولار
+                err, res = await act_buy_gold(user, amount)
+                if err:
+                    await message.reply(err, mention_author=False)
+                else:
+                    await message.reply(content=res[0], file=res[1], mention_author=False)
+                return True
             err, res = await _ACT_FUNCS[action](user, amount=amount, game=word if action == "invest" else None)
     except Exception as e:
         import traceback
@@ -5178,6 +5240,949 @@ async def handle_extra_bank(message: discord.Message, word: str, rest: list) -> 
     else:
         text, file = res
         await message.reply(content=text, file=file, mention_author=False) if file else await message.reply(content=text, mention_author=False)
+    return True
+
+
+
+# =====================================================================
+#        🎭  المافيا - رسومات (لوبي / دور اللاعب / ليل ونهار متحرك / نتائج / لوحة اللاعبين)
+# =====================================================================
+MAFIA_ROLES = {
+    "mafia":     {"name": "مافيا",  "color": (214, 56, 60),   "desc": "اقتل بالليل وتخفّى بالنهار"},
+    "doctor":    {"name": "طبيب",   "color": (70, 190, 120),  "desc": "أنقذ شخص كل ليلة من القتل"},
+    "detective": {"name": "شايب",   "color": (80, 150, 235),  "desc": "اكشف هوية شخص كل ليلة"},
+    "citizen":   {"name": "مواطن",  "color": (226, 190, 100), "desc": "اكشف المافيا بالنقاش والتصويت"},
+}
+_MF_THEMES = {
+    "lobby": [(0, (96, 50, 28)), (.55, (48, 26, 16)), (1, (18, 9, 5))],
+    "night": [(0, (46, 52, 110)), (.55, (22, 26, 62)), (1, (8, 10, 28))],
+    "day":   [(0, (255, 214, 130)), (.55, (214, 130, 70)), (1, (96, 50, 28))],
+    "vote":  [(0, (110, 70, 40)), (.55, (52, 30, 18)), (1, (18, 9, 5))],
+    "dead":  [(0, (120, 30, 34)), (.55, (58, 16, 20)), (1, (16, 6, 8))],
+    "town":  [(0, (70, 150, 96)), (.55, (30, 76, 52)), (1, (8, 24, 16))],
+    "mafia": [(0, (130, 30, 36)), (.55, (50, 14, 18)), (1, (10, 4, 6))],
+}
+
+
+def _mf_canvas(W, H, theme, k=2):
+    stops = [(r * W * k, c) for r, c in _MF_THEMES[theme]]
+    img = _radial_gradient((W * k, H * k), (W * k * .5, H * k * .3), stops).convert("RGBA")
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((6 * k, 6 * k, W * k - 6 * k, H * k - 6 * k), radius=34 * k, outline=(224, 186, 90, 255), width=int(3 * k))
+    d.rounded_rectangle((13 * k, 13 * k, W * k - 13 * k, H * k - 13 * k), radius=28 * k, outline=BRAND_BROWN + (255,), width=int(2 * k))
+    return img, d
+
+
+def _mf_role_icon(d, cx, cy, s, role, alpha=255):
+    """أيقونة الدور مرسومة بالكود (cx, cy مركز، s الحجم)."""
+    A = alpha
+    if role == "mafia":
+        d.ellipse((cx - .5 * s, cy + .02 * s, cx + .5 * s, cy + .26 * s), fill=(36, 36, 44, A), outline=(0, 0, 0, A))
+        d.polygon([(cx - .27 * s, cy + .1 * s), (cx - .22 * s, cy - .24 * s), (cx - .08 * s, cy - .3 * s), (cx + .08 * s, cy - .3 * s),
+                   (cx + .22 * s, cy - .24 * s), (cx + .27 * s, cy + .1 * s)], fill=(52, 52, 62, A), outline=(0, 0, 0, A))
+        d.rectangle((cx - .27 * s, cy - .04 * s, cx + .27 * s, cy + .1 * s), fill=(200, 40, 48, A))
+        for ex in (-.14, .14):                                           # عيون القناع تحت القبعة
+            d.ellipse((cx + ex * s - .07 * s, cy + .3 * s, cx + ex * s + .07 * s, cy + .4 * s), fill=(255, 255, 255, A))
+    elif role == "doctor":
+        d.rounded_rectangle((cx - .42 * s, cy - .42 * s, cx + .42 * s, cy + .42 * s), radius=int(.14 * s), fill=(250, 250, 250, A))
+        d.rectangle((cx - .12 * s, cy - .3 * s, cx + .12 * s, cy + .3 * s), fill=(220, 50, 60, A))
+        d.rectangle((cx - .3 * s, cy - .12 * s, cx + .3 * s, cy + .12 * s), fill=(220, 50, 60, A))
+    elif role == "detective":
+        d.ellipse((cx - .36 * s, cy - .4 * s, cx + .2 * s, cy + .16 * s), outline=(245, 245, 250, A), width=max(3, int(.07 * s)))
+        d.ellipse((cx - .3 * s, cy - .34 * s, cx + .14 * s, cy + .1 * s), fill=(120, 180, 240, int(A * .45)))
+        d.line([(cx + .14 * s, cy + .1 * s), (cx + .42 * s, cy + .4 * s)], fill=(245, 245, 250, A), width=max(4, int(.1 * s)))
+        d.arc((cx - .26 * s, cy - .3 * s, cx + 0.02 * s, cy - .02 * s), 200, 280, fill=(255, 255, 255, A), width=max(2, int(.03 * s)))
+    else:  # citizen
+        d.ellipse((cx - .17 * s, cy - .4 * s, cx + .17 * s, cy - .06 * s), fill=(250, 232, 190, A))
+        d.pieslice((cx - .36 * s, cy + .0 * s, cx + .36 * s, cy + .72 * s), 180, 360, fill=(250, 232, 190, A))
+
+
+def _mf_av(img, avatar, x, y, size, k, alive=True, ring=(224, 186, 90)):
+    """أفاتار دائري (مع تظليل للميت)."""
+    try:
+        av = _circle_avatar(avatar, int(size * k)) if avatar else None
+    except Exception:
+        av = None
+    d = ImageDraw.Draw(img)
+    d.ellipse((x * k - 3 * k, y * k - 3 * k, (x + size) * k + 3 * k, (y + size) * k + 3 * k), fill=(ring if alive else (90, 90, 96)) + (255,))
+    if av is None:
+        av = Image.new("RGBA", (int(size * k), int(size * k)), (150, 110, 80, 255))
+        m = Image.new("L", av.size, 0)
+        ImageDraw.Draw(m).ellipse((0, 0, av.width - 1, av.height - 1), fill=255)
+        av.putalpha(m)
+    if not alive:
+        gray = ImageEnhance.Color(av.convert("RGB")).enhance(0).convert("RGBA")
+        gray = ImageEnhance.Brightness(gray).enhance(.55)
+        gray.putalpha(av.getchannel("A"))
+        av = gray
+    img.alpha_composite(av, (int(x * k), int(y * k)))
+    if not alive:
+        d = ImageDraw.Draw(img)
+        c = (x + size / 2) * k, (y + size / 2) * k
+        r = size * k * .34
+        d.line([(c[0] - r, c[1] - r), (c[0] + r, c[1] + r)], fill=(230, 60, 60, 255), width=int(4 * k))
+        d.line([(c[0] - r, c[1] + r), (c[0] + r, c[1] - r)], fill=(230, 60, 60, 255), width=int(4 * k))
+
+
+def _mf_finish(img, size, k=2):
+    return _to_png(img, size)
+
+
+def _render_mafia_panel() -> io.BytesIO:
+    k, W, H = 2, 760, 400
+    img, d = _mf_canvas(W, H, "lobby", k)
+    _mf_role_icon(d, 120 * k, 150 * k, 150 * k, "mafia")
+    _text(d, (W * k - 40 * k, 78 * k), "لعبة المافيا", int(54 * k), (255, 255, 255, 255), "rm")
+    _text(d, (W * k - 40 * k, 128 * k), "لعبة جماعية: اكشف المافيا قبل ما يقتلونكم!", int(22 * k), (236, 205, 140, 255), "rm")
+    lines = ["من 5 لاعبين وفوق  •  ليل ونهار وتصويت", "أدوار: مافيا • طبيب • شايب • مواطن", "الأوامر بدون سلاش: مافيا / انضم / ابدأ", "الفايز ياخذ مكافأة من البنك"]
+    for i, t in enumerate(lines):
+        _text(d, (W * k - 40 * k, (190 + i * 42) * k), t, int(24 * k), (255, 255, 255, 235), "rm")
+    for i, r in enumerate(("mafia", "doctor", "detective", "citizen")):
+        cx = (70 + i * 68) * k
+        d.ellipse((cx - 28 * k, 322 * k - 28 * k, cx + 28 * k, 322 * k + 28 * k), fill=(30, 16, 10, 255), outline=MAFIA_ROLES[r]["color"] + (255,), width=int(2.5 * k))
+        _mf_role_icon(d, cx, 322 * k, 40 * k, r)
+    return _mf_finish(img, (W, H))
+
+
+def _render_mafia_lobby(host_name, players, min_p, max_p, status="بانتظار اللاعبين") -> io.BytesIO:
+    """players: [(name, avatar_bytes)]"""
+    k, W = 2, 760
+    cols = 5
+    rows = max(1, math.ceil(max(len(players), 1) / cols))
+    H = 250 + rows * 118
+    img, d = _mf_canvas(W, H, "lobby", k)
+    _text(d, (W * k - 40 * k, 56 * k), "غرفة المافيا", int(46 * k), (255, 255, 255, 255), "rm")
+    _text_fit(d, (W * k - 40 * k, 100 * k), f"المضيف: {_trunc(host_name, 18)}", int(22 * k), (236, 205, 140, 255), "rm", 420 * k)
+    ok = len(players) >= min_p
+    badge = (96, 214, 130) if ok else (240, 170, 70)
+    d.rounded_rectangle((40 * k, 40 * k, 250 * k, 108 * k), radius=18 * k, fill=(30, 16, 10, 255), outline=badge + (255,), width=int(2 * k))
+    _text(d, (145 * k, 62 * k), "اللاعبين", int(16 * k), (210, 180, 130, 255), "mm")
+    _text(d, (145 * k, 90 * k), f"{len(players)} / {max_p}", int(30 * k), badge + (255,), "mm")
+    _text(d, (W * k / 2, 142 * k), status if ok else f"{status} • يحتاج {min_p} لاعبين على الأقل", int(20 * k), badge + (255,), "mm")
+    d.line([(40 * k, 168 * k), ((W - 40) * k, 168 * k)], fill=(224, 186, 90, 90), width=int(1.4 * k))
+    for i in range(max(len(players), 0)):
+        r, c = divmod(i, cols)
+        name, av = players[i]
+        x = 62 + c * 136
+        y = 190 + r * 118
+        _mf_av(img, av, x, y, 74, k)
+        d = ImageDraw.Draw(img)
+        _text_fit(d, ((x + 37) * k, (y + 94) * k), _trunc(name, 12), int(17 * k), (255, 255, 255, 255), "mm", 120 * k)
+    if not players:
+        _text(d, (W * k / 2, 260 * k), "ما فيه لاعبين بعد - اضغط انضم!", int(24 * k), (255, 255, 255, 200), "mm")
+    return _mf_finish(img, (W, H))
+
+
+def _render_mafia_role(role, name, avatar, teammates=None) -> io.BytesIO:
+    k, W, H = 2, 640, 420 if teammates else 360
+    img, d = _mf_canvas(W, H, "lobby", k)
+    info = MAFIA_ROLES[role]
+    col = info["color"]
+    d.ellipse((W * k / 2 - 92 * k, 40 * k, W * k / 2 + 92 * k, 224 * k), fill=(30, 16, 10, 255), outline=col + (255,), width=int(4 * k))
+    _mf_role_icon(d, W * k / 2, 132 * k, 130 * k, role)
+    _text(d, (W * k / 2, 262 * k), f"دورك: {info['name']}", int(44 * k), col + (255,), "mm", stroke_width=int(2 * k), stroke_fill=(0, 0, 0, 255))
+    _text(d, (W * k / 2, 308 * k), info["desc"], int(22 * k), (255, 255, 255, 235), "mm")
+    if teammates:
+        _text_fit(d, (W * k / 2, 360 * k), "فريقك: " + "، ".join(teammates), int(20 * k), (255, 214, 150, 255), "mm", 560 * k)
+    _text(d, (W * k / 2, (H - 22) * k), "لا تكشف دورك لأحد!", int(15 * k), (255, 255, 255, 140), "mm")
+    return _mf_finish(img, (W, H))
+
+
+def _render_mafia_scene(kind, subtitle, alive, total, round_no) -> io.BytesIO:
+    """kind: night | day  => GIF متحرك (نجوم تلمع / أشعة شمس) | vote => صورة ثابتة"""
+    k, W, H = 2, 760, 300
+    frames, durs = [], []
+    n = 8 if kind in ("night", "day") else 1
+    rnd = random.Random(round_no * 7 + (1 if kind == "night" else 2))
+    stars = [(rnd.randint(30, W - 30), rnd.randint(25, H - 80), rnd.uniform(1.5, 3.4), rnd.random() * 6.28) for _ in range(46)]
+    for f in range(n):
+        img, d = _mf_canvas(W, H, kind if kind in ("night", "day") else "vote", k)
+        ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        od = ImageDraw.Draw(ov)
+        if kind == "night":
+            for sx, sy, sr, ph in stars:
+                a = int(130 + 125 * math.sin(f / n * 6.28 + ph))
+                od.ellipse(((sx - sr) * k, (sy - sr) * k, (sx + sr) * k, (sy + sr) * k), fill=(255, 250, 220, max(40, a)))
+            mx, my, mr = 120, 120, 46
+            glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            ImageDraw.Draw(glow).ellipse(((mx - mr * 1.7) * k, (my - mr * 1.7) * k, (mx + mr * 1.7) * k, (my + mr * 1.7) * k), fill=(255, 245, 200, 70 + 20 * int(math.sin(f / n * 6.28) + 1)))
+            glow = glow.filter(ImageFilter.GaussianBlur(14 * k))
+            ov.alpha_composite(glow)
+            od = ImageDraw.Draw(ov)
+            od.ellipse(((mx - mr) * k, (my - mr) * k, (mx + mr) * k, (my + mr) * k), fill=(252, 246, 214, 255))
+            od.ellipse(((mx - mr + 22) * k, (my - mr - 6) * k, (mx + mr + 22) * k, (my + mr - 6) * k), fill=(24, 28, 66, 255))
+        elif kind == "day":
+            sx, sy, sr = 120, 120, 40
+            for i in range(14):
+                ang = math.radians(i * (360 / 14) + f * (360 / 14 / n))
+                od.line([(sx + math.cos(ang) * (sr + 8) , sy + math.sin(ang) * (sr + 8)), (sx + math.cos(ang) * (sr + 34), sy + math.sin(ang) * (sr + 34))], fill=(255, 236, 150, 255), width=5)
+            ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            od = ImageDraw.Draw(ov)
+            for i in range(14):
+                ang = math.radians(i * (360 / 14) + f * (360 / 14 / n))
+                od.line([((sx + math.cos(ang) * (sr + 8)) * k, (sy + math.sin(ang) * (sr + 8)) * k), ((sx + math.cos(ang) * (sr + 36)) * k, (sy + math.sin(ang) * (sr + 36)) * k)], fill=(255, 238, 150, 255), width=int(5 * k))
+            od.ellipse(((sx - sr) * k, (sy - sr) * k, (sx + sr) * k, (sy + sr) * k), fill=(255, 220, 80, 255), outline=(255, 250, 200, 255), width=int(3 * k))
+        else:  # vote: صندوق اقتراع
+            bx, by = 120, 150
+            od.rounded_rectangle(((bx - 54) * k, (by - 30) * k, (bx + 54) * k, (by + 52) * k), radius=int(10 * k), fill=(216, 170, 80, 255), outline=(120, 80, 20, 255), width=int(3 * k))
+            od.rectangle(((bx - 28) * k, (by - 20) * k, (bx + 28) * k, (by - 12) * k), fill=(40, 24, 12, 255))
+            od.polygon([((bx - 18) * k, (by - 56) * k), ((bx + 18) * k, (by - 56) * k), ((bx + 18) * k, (by - 14) * k), ((bx - 18) * k, (by - 14) * k)], fill=(250, 250, 250, 255))
+        img.alpha_composite(ov)
+        d = ImageDraw.Draw(img)
+        title = {"night": f"الليل  #{round_no}", "day": f"النهار  #{round_no}", "vote": "وقت التصويت"}[kind]
+        _text(d, (W * k - 44 * k, 96 * k), title, int(54 * k), (255, 255, 255, 255), "rm", stroke_width=int(2 * k), stroke_fill=(0, 0, 0, 160))
+        _text_fit(d, (W * k - 44 * k, 154 * k), subtitle, int(23 * k), (255, 240, 205, 255), "rm", 520 * k)
+        d.rounded_rectangle((W * k - 200 * k, 198 * k, W * k - 44 * k, 252 * k), radius=18 * k, fill=(20, 12, 8, 200), outline=(224, 186, 90, 255), width=int(2 * k))
+        _text(d, (W * k - 122 * k, 225 * k), f"الأحياء {alive}/{total}", int(22 * k), (255, 255, 255, 255), "mm")
+        frames.append(img.resize((W, H), Image.BOX).convert("RGB"))
+        durs.append(140)
+    buf = io.BytesIO()
+    if n == 1:
+        frames[0].save(buf, format="PNG")
+        buf.seek(0)
+        return buf, "scene.png"
+    pal = frames[0].quantize(colors=255, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+    q = [f.quantize(palette=pal, dither=Image.Dither.NONE) for f in frames]
+    q[0].save(buf, format="GIF", save_all=True, append_images=q[1:], duration=durs, loop=0, optimize=False)
+    buf.seek(0)
+    return buf, "scene.gif"
+
+
+def _render_mafia_event(theme, title, name, avatar, role, subtitle, bars=None) -> io.BytesIO:
+    """حدث (قتل/طرد/إنقاذ/تعادل): بطاقة لاعب + دوره + (اختياري) أعمدة التصويت. bars: [(name,count)]"""
+    k, W = 2, 760
+    H = 360 if not bars else max(360, 190 + len(bars) * 40)
+    img, d = _mf_canvas(W, H, theme, k)
+    _text(d, (W * k / 2, 54 * k), title, int(40 * k), (255, 255, 255, 255), "mm", stroke_width=int(2 * k), stroke_fill=(0, 0, 0, 170))
+    cx = 150 if bars else W / 2 - 150
+    if name:
+        _mf_av(img, avatar, cx - 62, 96, 124, k, alive=(theme not in ("dead",)))
+        d = ImageDraw.Draw(img)
+        _text_fit(d, (cx * k, 246 * k), _trunc(name, 14), int(26 * k), (255, 255, 255, 255), "mm", 230 * k)
+        if role:
+            col = MAFIA_ROLES[role]["color"]
+            d.rounded_rectangle(((cx - 74) * k, 268 * k, (cx + 74) * k, 306 * k), radius=16 * k, fill=(20, 12, 8, 230), outline=col + (255,), width=int(2 * k))
+            _text(d, ((cx + 10) * k, 287 * k), MAFIA_ROLES[role]["name"], int(22 * k), col + (255,), "mm")
+            _mf_role_icon(d, (cx - 44) * k, 287 * k, 28 * k, role)
+    else:
+        _mf_role_icon(d, cx * k, 170 * k, 150 * k, "doctor")
+    if not bars:
+        _text_fit(d, ((W / 2 + 80) * k, 170 * k), subtitle, int(26 * k), (255, 240, 205, 255), "mm", 330 * k)
+    else:
+        top = max(c for _, c in bars) or 1
+        for i, (bn, bc) in enumerate(bars):
+            y = (100 + i * 40) * k
+            _text_fit(d, ((W - 50) * k, y + 14 * k), _trunc(bn, 12), int(20 * k), (255, 255, 255, 255), "rm", 150 * k)
+            bx0, bx1 = 300 * k, (W - 220) * k
+            d.rounded_rectangle((bx0, y, bx1, y + 28 * k), radius=10 * k, fill=(20, 12, 8, 220))
+            if bc:
+                w = (bx1 - bx0) * bc / top
+                d.rounded_rectangle((bx1 - w, y, bx1, y + 28 * k), radius=10 * k, fill=((236, 90, 80) if bc == top else (224, 186, 90)) + (255,))
+            _text(d, (bx0 - 12 * k, y + 14 * k), str(bc), int(20 * k), (255, 255, 255, 255), "rm")
+        _text_fit(d, (W * k / 2, (H - 30) * k), subtitle, int(21 * k), (255, 240, 205, 255), "mm", 680 * k)
+    return _mf_finish(img, (W, H))
+
+
+def _render_mafia_board(title, players) -> io.BytesIO:
+    """players: [(name, avatar, alive, role_or_None)]"""
+    k, W, cols = 2, 760, 5
+    rows = max(1, math.ceil(len(players) / cols))
+    H = 150 + rows * 138
+    img, d = _mf_canvas(W, H, "lobby", k)
+    alive_n = sum(1 for p in players if p[2])
+    _text(d, (W * k - 40 * k, 60 * k), title, int(40 * k), (255, 255, 255, 255), "rm")
+    _text(d, (40 * k, 60 * k), f"الأحياء {alive_n}/{len(players)}", int(24 * k), (236, 205, 140, 255), "lm")
+    for i, (name, av, alive, role) in enumerate(players):
+        r, c = divmod(i, cols)
+        x, y = 62 + c * 136, 110 + r * 138
+        _mf_av(img, av, x, y, 74, k, alive=alive)
+        d = ImageDraw.Draw(img)
+        _text_fit(d, ((x + 37) * k, (y + 94) * k), _trunc(name, 12), int(17 * k), (255, 255, 255, 255 if alive else 150), "mm", 120 * k)
+        if role and not alive:
+            _text(d, ((x + 37) * k, (y + 116) * k), MAFIA_ROLES[role]["name"], int(15 * k), MAFIA_ROLES[role]["color"] + (255,), "mm")
+    return _mf_finish(img, (W, H))
+
+
+def _render_mafia_win(winner, rows) -> io.BytesIO:
+    """winner: 'town'|'mafia' | rows: [(name, avatar, role, alive, reward_text)]"""
+    k, W = 2, 760
+    H = 190 + len(rows) * 66
+    img, d = _mf_canvas(W, H, winner, k)
+    title = "فاز الأهالي!" if winner == "town" else "فازت المافيا!"
+    _text(d, (W * k / 2, 62 * k), title, int(56 * k), (255, 255, 255, 255), "mm", stroke_width=int(3 * k), stroke_fill=(0, 0, 0, 180))
+    _text(d, (W * k / 2, 112 * k), "انتهت اللعبة - هذي أدوار الجميع", int(21 * k), (255, 240, 205, 235), "mm")
+    for i, (name, av, role, alive, reward) in enumerate(rows):
+        y = 148 + i * 66
+        d.rounded_rectangle((40 * k, y * k, (W - 40) * k, (y + 56) * k), radius=18 * k, fill=(20, 12, 8, 200), outline=MAFIA_ROLES[role]["color"] + (200,), width=int(1.6 * k))
+        _mf_av(img, av, 52, y + 6, 44, k, alive=alive, ring=MAFIA_ROLES[role]["color"])
+        d = ImageDraw.Draw(img)
+        _text_fit(d, (108 * k, (y + 28) * k), _trunc(name, 16), int(22 * k), (255, 255, 255, 255 if alive else 160), "lm", 300 * k)
+        _mf_role_icon(d, (W - 150) * k, (y + 28) * k, 36 * k, role)
+        _text(d, ((W - 126) * k, (y + 28) * k), MAFIA_ROLES[role]["name"], int(20 * k), MAFIA_ROLES[role]["color"] + (255,), "lm")
+        _text(d, (330 * k, (y + 28) * k), reward, int(20 * k), (110, 220, 140, 255), "lm")
+    return _mf_finish(img, (W, H))
+
+
+# =====================================================================
+#        🎭  المافيا - منطق اللعبة + الأوامر النصية (بدون سلاش) + لوحة مثبتة
+# =====================================================================
+MAFIA_MIN_PLAYERS = int(os.getenv("MAFIA_MIN_PLAYERS", "5"))
+MAFIA_MAX_PLAYERS = 20
+MAFIA_NIGHT_SECONDS = 50
+MAFIA_DISCUSS_SECONDS = 70
+MAFIA_VOTE_SECONDS = 45
+MAFIA_WIN_REWARD = 3000
+MAFIA_PLAY_REWARD = 500
+MAFIA_ENV_CHANNEL_ID = int(os.getenv("MAFIA_CHANNEL_ID", "0"))
+MAFIA_GAMES: dict = {}          # channel_id -> MafiaGame
+
+
+def mafia_channel_id() -> int:
+    return load_db().get("mafia", {}).get("channel") or MAFIA_ENV_CHANNEL_ID
+
+
+def mafia_role_counts(n: int) -> dict:
+    mafia = 1 if n <= 5 else n // 3
+    detective = 1 if n >= 5 else 0
+    doctor = 1 if n >= 5 else 0
+    return {"mafia": mafia, "doctor": doctor, "detective": detective, "citizen": n - mafia - doctor - detective}
+
+
+def mafia_assign_roles(ids: list) -> dict:
+    counts = mafia_role_counts(len(ids))
+    pool = [r for r, c in counts.items() for _ in range(c)]
+    random.shuffle(pool)
+    return dict(zip(ids, pool))
+
+
+def mafia_win_state(roles_alive: list):
+    """roles_alive: أدوار الأحياء. يرجع 'town' / 'mafia' / None"""
+    m = sum(1 for r in roles_alive if r == "mafia")
+    t = len(roles_alive) - m
+    if m == 0:
+        return "town"
+    if m >= t:
+        return "mafia"
+    return None
+
+
+def mafia_tally(votes: dict):
+    """votes: {voter: target_id أو 0 للتخطي} -> (eliminated_id أو None, counts)"""
+    counts: dict = {}
+    for tgt in votes.values():
+        counts[tgt] = counts.get(tgt, 0) + 1
+    real = {t: c for t, c in counts.items() if t != 0}
+    if not real:
+        return None, counts
+    top = max(real.values())
+    leaders = [t for t, c in real.items() if c == top]
+    if len(leaders) > 1 or counts.get(0, 0) >= top:
+        return None, counts
+    return leaders[0], counts
+
+
+class MafiaPlayer:
+    def __init__(self, member, avatar):
+        self.id = member.id
+        self.member = member
+        self.name = _clean_name(member.display_name)
+        self.avatar = avatar
+        self.role = "citizen"
+        self.alive = True
+
+
+class MafiaGame:
+    def __init__(self, channel, host):
+        self.channel, self.host_id, self.host_name = channel, host.id, _clean_name(host.display_name)
+        self.players: dict = {}
+        self.state = "lobby"            # lobby / night / day / vote / ended
+        self.round = 0
+        self.lobby_msg = None
+        self.task = None
+        self.skip_event = asyncio.Event()
+        self.actions_event = asyncio.Event()
+        self.vote_event = asyncio.Event()
+        self.kill_votes: dict = {}
+        self.save_target = None
+        self.check_target = None
+        self.doctor_self_used = False
+        self.votes: dict = {}
+        self.muted: list = []
+        self.thread = None
+
+    # ----- مساعدات -----
+    def alive(self) -> list:
+        return [p for p in self.players.values() if p.alive]
+
+    def alive_by_role(self, role) -> list:
+        return [p for p in self.alive() if p.role == role]
+
+    def card_players(self, reveal_dead=True):
+        return [(p.name, p.avatar, p.alive, p.role if (not p.alive and reveal_dead) else None) for p in self.players.values()]
+
+    async def say(self, **kw):
+        return await self.channel.send(**kw)
+
+    async def say_image(self, buf, filename, content=None, view=None):
+        return await self.channel.send(content=content, file=discord.File(buf, filename=filename), view=view)
+
+    def lobby_buf(self):
+        return _render_mafia_lobby(self.host_name, [(p.name, p.avatar) for p in self.players.values()], MAFIA_MIN_PLAYERS, MAFIA_MAX_PLAYERS)
+
+    async def refresh_lobby(self):
+        if not self.lobby_msg:
+            return
+        buf = await _run_sync(self.lobby_buf)
+        try:
+            await self.lobby_msg.edit(attachments=[discord.File(buf, filename="lobby.png")], view=MafiaLobbyView(self))
+        except Exception:
+            pass
+
+    # ----- لوبي -----
+    async def join(self, member) -> str:
+        if self.state != "lobby":
+            return "❌ اللعبة بدأت، انتظر الجولة الجاية."
+        if member.id in self.players:
+            return "✅ أنت داخل اللعبة أصلاً."
+        if len(self.players) >= MAFIA_MAX_PLAYERS:
+            return "❌ اللعبة امتلت."
+        try:
+            av = await _avatar_bytes(member)
+        except Exception:
+            av = None
+        self.players[member.id] = MafiaPlayer(member, av)
+        await self.refresh_lobby()
+        return f"✅ انضممت للعبة! ({len(self.players)}/{MAFIA_MAX_PLAYERS})"
+
+    async def leave(self, member) -> str:
+        if self.state != "lobby":
+            return "❌ ما تقدر تنسحب بعد بدء اللعبة."
+        if member.id not in self.players:
+            return "❌ أنت مو داخل اللعبة."
+        del self.players[member.id]
+        await self.refresh_lobby()
+        return "👋 انسحبت من اللعبة."
+
+    async def start(self, who) -> str:
+        if self.state != "lobby":
+            return "❌ اللعبة بدأت أصلاً."
+        if who.id != self.host_id and not who.guild_permissions.administrator:
+            return "❌ بس المضيف (أو الإدارة) يقدر يبدأ اللعبة."
+        if len(self.players) < MAFIA_MIN_PLAYERS:
+            return f"❌ نحتاج {MAFIA_MIN_PLAYERS} لاعبين على الأقل (الحين {len(self.players)})."
+        roles = mafia_assign_roles(list(self.players))
+        for pid, role in roles.items():
+            self.players[pid].role = role
+        self.state = "night"
+        self.task = asyncio.create_task(self.run())
+        return ""
+
+    async def cancel(self, who) -> str:
+        if who.id != self.host_id and not who.guild_permissions.administrator:
+            return "❌ بس المضيف (أو الإدارة) يقدر يلغي اللعبة."
+        await self.end_game(None, cancelled=True)
+        return "🛑 تم إلغاء اللعبة."
+
+    # ----- ضبط الصلاحيات -----
+    async def mute(self, player):
+        try:
+            await self.channel.set_permissions(player.member, send_messages=False, reason="مافيا: لاعب ميت")
+            self.muted.append(player.id)
+            db = load_db()
+            lst = db.setdefault("mafia", {}).setdefault("muted", [])
+            if player.id not in lst:
+                lst.append(player.id)
+            save_db(db)
+        except Exception:
+            pass
+
+    async def unmute_all(self):
+        for pid in list(self.muted):
+            m = self.channel.guild.get_member(pid)
+            if m:
+                try:
+                    await self.channel.set_permissions(m, overwrite=None, reason="مافيا: انتهت اللعبة")
+                except Exception:
+                    pass
+        self.muted.clear()
+        db = load_db()
+        db.setdefault("mafia", {})["muted"] = []
+        save_db(db)
+
+    # ----- مجرى اللعبة -----
+    async def run(self):
+        try:
+            await self.reveal_roles()
+            while True:
+                if await self.night():
+                    return
+                if await self.day():
+                    return
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                await self.say(content=f"⚠️ صار خطأ بالمافيا وتوقفت اللعبة: {e}")
+            except Exception:
+                pass
+            await self.end_game(None, cancelled=True)
+
+    async def reveal_roles(self):
+        mafia = [p for p in self.players.values() if p.role == "mafia"]
+        buf = await _run_sync(_render_mafia_board, "بدأت اللعبة!", self.card_players(False))
+        await self.say_image(buf, "board.png",
+                             content=("🎭 **بدأت المافيا!** اضغط الزر عشان تعرف دورك (يظهر لك أنت بس).\n"
+                                      f"👥 {len(self.players)} لاعبين • 🕶️ مافيا: {len(mafia)} • 🩺 طبيب • 🔍 شايب"),
+                             view=RoleRevealView(self))
+        # غرفة سرية للمافيا (ثريد خاص) - اختياري، لو ما نفع نكمل عادي
+        if len(mafia) >= 2:
+            try:
+                self.thread = await self.channel.create_thread(name="🕶️ غرفة المافيا", type=discord.ChannelType.private_thread, invitable=False)
+                for p in mafia:
+                    await self.thread.add_user(p.member)
+                await self.thread.send("🕶️ **غرفة المافيا السرية**: " + " ".join(p.member.mention for p in mafia) + "\nنسقوا هنا مين تقتلون!")
+            except Exception:
+                self.thread = None
+        await asyncio.sleep(8)
+
+    def _wait_actors_done(self) -> bool:
+        need_kill = all(p.id in self.kill_votes for p in self.alive_by_role("mafia"))
+        need_save = (not self.alive_by_role("doctor")) or self.save_target is not None
+        need_check = (not self.alive_by_role("detective")) or self.check_target is not None
+        return need_kill and need_save and need_check
+
+    async def night(self) -> bool:
+        self.round += 1
+        self.state = "night"
+        self.kill_votes, self.save_target, self.check_target = {}, None, None
+        self.actions_event.clear()
+        alive = self.alive()
+        buf, name = await _run_sync(_render_mafia_scene, "night", "المافيا تتحرك.. والكل نايم", len(alive), len(self.players), self.round)
+        msg = await self.say_image(buf, name, content="🌙 **حل الليل!** أصحاب الأدوار اضغطوا الزر ونفّذوا دوركم (خلال %d ثانية)." % MAFIA_NIGHT_SECONDS,
+                                   view=NightView(self))
+        try:
+            await asyncio.wait_for(self.actions_event.wait(), timeout=MAFIA_NIGHT_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await msg.edit(view=None)
+        except Exception:
+            pass
+        # ---- حسم الليل ----
+        victim_id = None
+        if self.kill_votes:
+            cnt: dict = {}
+            for t in self.kill_votes.values():
+                cnt[t] = cnt.get(t, 0) + 1
+            top = max(cnt.values())
+            victim_id = random.choice([t for t, c in cnt.items() if c == top])
+        saved = victim_id is not None and victim_id == self.save_target
+        if victim_id and not saved:
+            v = self.players[victim_id]
+            v.alive = False
+            await self.mute(v)
+            buf = await _run_sync(_render_mafia_event, "dead", "طلع الفجر.. وفيه ضحية!", v.name, v.avatar, v.role, "")
+            await self.say_image(buf, "event.png", content=f"💀 المافيا قتلت {v.member.mention} بالليل!")
+        else:
+            sub = "الطبيب أنقذ الضحية بآخر لحظة!" if saved else "المافيا ما قتلت أحد الليلة"
+            buf = await _run_sync(_render_mafia_event, "town", "طلع الفجر.. ومحد مات!", None, None, None, sub)
+            await self.say_image(buf, "event.png", content="🌅 " + sub)
+        return await self.check_end()
+
+    async def day(self) -> bool:
+        self.state = "day"
+        self.skip_event.clear()
+        alive = self.alive()
+        buf, name = await _run_sync(_render_mafia_scene, "day", "ناقشوا ومين تشكون فيه؟", len(alive), len(self.players), self.round)
+        await self.say_image(buf, name, content=(f"☀️ **النقاش مفتوح** ({MAFIA_DISCUSS_SECONDS} ثانية) - الأموات لا يتكلمون!\n"
+                                                  "👥 الأحياء: " + "، ".join(p.member.mention for p in alive) + "\n(المضيف يكتب `تخطي` لإنهاء النقاش)"))
+        try:
+            await asyncio.wait_for(self.skip_event.wait(), timeout=MAFIA_DISCUSS_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+        # ---- التصويت ----
+        self.state = "vote"
+        self.votes = {}
+        self.vote_event.clear()
+        buf, name = await _run_sync(_render_mafia_scene, "vote", "صوّتوا على اللي تشكون فيه", len(alive), len(self.players), self.round)
+        vmsg = await self.say_image(buf, name, content=f"🗳️ **التصويت** ({MAFIA_VOTE_SECONDS} ثانية) - اختر من القائمة (تصويتك سري لين تنتهي الجولة).",
+                                    view=VoteView(self))
+        try:
+            await asyncio.wait_for(self.vote_event.wait(), timeout=MAFIA_VOTE_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await vmsg.edit(view=None)
+        except Exception:
+            pass
+        elim_id, counts = mafia_tally(self.votes)
+        bars = []
+        for pid, c in sorted(counts.items(), key=lambda kv: -kv[1]):
+            bars.append(("تخطي" if pid == 0 else self.players[pid].name, c))
+        if not bars:
+            bars = [("ما أحد صوّت", 0)]
+        if elim_id:
+            p = self.players[elim_id]
+            p.alive = False
+            await self.mute(p)
+            buf = await _run_sync(_render_mafia_event, "vote", "نتيجة التصويت", p.name, p.avatar, p.role, f"تم طرد {p.name} - كان {MAFIA_ROLES[p.role]['name']}", bars)
+            await self.say_image(buf, "event.png", content=f"⚖️ الأغلبية قررت طرد {p.member.mention}!")
+        else:
+            buf = await _run_sync(_render_mafia_event, "vote", "نتيجة التصويت", None, None, None, "تعادل أو تخطي - ما أحد انطرد", bars)
+            await self.say_image(buf, "event.png", content="⚖️ ما وصلنا لأغلبية، ما أحد انطرد.")
+        return await self.check_end()
+
+    async def check_end(self) -> bool:
+        winner = mafia_win_state([p.role for p in self.alive()])
+        if winner:
+            await self.end_game(winner)
+            return True
+        return False
+
+    async def end_game(self, winner, cancelled=False):
+        prev = self.state
+        self.state = "ended"
+        MAFIA_GAMES.pop(self.channel.id, None)
+        await self.unmute_all()
+        if self.thread:
+            try:
+                await self.thread.delete()
+            except Exception:
+                pass
+        if cancelled or not winner:
+            if self.lobby_msg and prev == "lobby":
+                try:
+                    await self.lobby_msg.edit(view=None)
+                except Exception:
+                    pass
+            if self.task and self.task is not asyncio.current_task():
+                self.task.cancel()
+            return
+        rows = []
+        for p in self.players.values():
+            won = (p.role == "mafia") == (winner == "mafia")
+            reward = MAFIA_WIN_REWARD if won else MAFIA_PLAY_REWARD
+            update_balance(p.id, reward)
+            rows.append((p.name, p.avatar, p.role, p.alive, "+" + fmt_money(reward)))
+        buf = await _run_sync(_render_mafia_win, winner, rows)
+        await self.say_image(buf, "win.png", content="🏁 **انتهت اللعبة!** الفايزين ياخذون %s والباقي %s من البنك." % (fmt_money(MAFIA_WIN_REWARD), fmt_money(MAFIA_PLAY_REWARD)))
+
+
+# ----------------------------- الواجهات (أزرار/قوائم) -----------------------------
+class MafiaLobbyView(discord.ui.View):
+    def __init__(self, game: "MafiaGame"):
+        super().__init__(timeout=900)
+        self.game = game
+        for label, style, cb in (("✅ انضم", discord.ButtonStyle.success, self._join), ("🚪 انسحب", discord.ButtonStyle.secondary, self._leave),
+                                 ("▶️ ابدأ", discord.ButtonStyle.primary, self._start), ("🛑 إلغاء", discord.ButtonStyle.danger, self._cancel)):
+            b = discord.ui.Button(label=label, style=style)
+            b.callback = cb
+            self.add_item(b)
+
+    async def _join(self, interaction):
+        await interaction.response.send_message(await self.game.join(interaction.user), ephemeral=True)
+
+    async def _leave(self, interaction):
+        await interaction.response.send_message(await self.game.leave(interaction.user), ephemeral=True)
+
+    async def _start(self, interaction):
+        err = await self.game.start(interaction.user)
+        await interaction.response.send_message(err or "🎭 بدأت اللعبة!", ephemeral=True)
+        if not err:
+            try:
+                await self.game.lobby_msg.edit(view=None)
+            except Exception:
+                pass
+
+    async def _cancel(self, interaction):
+        await interaction.response.send_message(await self.game.cancel(interaction.user), ephemeral=True)
+
+    async def on_timeout(self):
+        if self.game.state == "lobby":
+            await self.game.end_game(None, cancelled=True)
+
+
+class RoleRevealView(discord.ui.View):
+    def __init__(self, game):
+        super().__init__(timeout=None)
+        self.game = game
+        b = discord.ui.Button(label="🎭 اكشف دورك", style=discord.ButtonStyle.primary)
+        b.callback = self._reveal
+        self.add_item(b)
+
+    async def _reveal(self, interaction):
+        p = self.game.players.get(interaction.user.id)
+        if not p:
+            return await interaction.response.send_message("❌ أنت مو لاعب بهالجولة.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        mates = [x.name for x in self.game.players.values() if x.role == "mafia" and x.id != p.id] if p.role == "mafia" else None
+        buf = await _run_sync(_render_mafia_role, p.role, p.name, p.avatar, mates if mates else None)
+        await interaction.followup.send(file=discord.File(buf, filename="role.png"), ephemeral=True)
+
+
+class TargetSelectView(discord.ui.View):
+    """قائمة اختيار الهدف (قتل / إنقاذ / تحقيق) تظهر للاعب بشكل خاص."""
+
+    def __init__(self, game, actor, action):
+        super().__init__(timeout=60)
+        self.game, self.actor, self.action = game, actor, action
+        options = []
+        for p in game.alive():
+            if action == "kill" and p.role == "mafia":
+                continue
+            if action == "check" and p.id == actor.id:
+                continue
+            if action == "save" and p.id == actor.id and game.doctor_self_used:
+                continue
+            options.append(discord.SelectOption(label=p.name[:90], value=str(p.id)))
+        self.sel = discord.ui.Select(placeholder={"kill": "🔪 اختر ضحيتك", "save": "🩺 اختر مين تنقذ", "check": "🔍 اختر مين تحقق فيه"}[action],
+                                     options=options[:25], min_values=1, max_values=1)
+        self.sel.callback = self._pick
+        self.add_item(self.sel)
+
+    async def _pick(self, interaction):
+        g = self.game
+        if g.state != "night":
+            return await interaction.response.edit_message(content="⌛ انتهى الليل.", view=None)
+        target = g.players[int(self.sel.values[0])]
+        if self.action == "kill":
+            g.kill_votes[self.actor.id] = target.id
+            msg = f"🔪 اخترت قتل **{target.name}**."
+            if g.thread:
+                try:
+                    await g.thread.send(f"🔪 {self.actor.name} صوّت على قتل **{target.name}**")
+                except Exception:
+                    pass
+        elif self.action == "save":
+            g.save_target = target.id
+            if target.id == self.actor.id:
+                g.doctor_self_used = True
+            msg = f"🩺 قررت تنقذ **{target.name}**."
+        else:
+            g.check_target = target.id
+            is_m = target.role == "mafia"
+            msg = f"🔍 **{target.name}** {'مافيا! 🕶️' if is_m else 'بريء ✅'}"
+        await interaction.response.edit_message(content=msg, view=None)
+        if g._wait_actors_done():
+            g.actions_event.set()
+
+
+class NightView(discord.ui.View):
+    def __init__(self, game):
+        super().__init__(timeout=MAFIA_NIGHT_SECONDS + 5)
+        self.game = game
+        b = discord.ui.Button(label="🌙 نفّذ دورك", style=discord.ButtonStyle.primary)
+        b.callback = self._act
+        self.add_item(b)
+
+    async def _act(self, interaction):
+        g = self.game
+        p = g.players.get(interaction.user.id)
+        if not p or not p.alive:
+            return await interaction.response.send_message("❌ أنت مو بالجولة أو ميت.", ephemeral=True)
+        if g.state != "night":
+            return await interaction.response.send_message("⌛ انتهى الليل.", ephemeral=True)
+        if p.role == "citizen":
+            return await interaction.response.send_message("😴 أنت مواطن.. نام بسلام وانتظر الصبح.", ephemeral=True)
+        action = {"mafia": "kill", "doctor": "save", "detective": "check"}[p.role]
+        done = {"kill": p.id in g.kill_votes, "save": g.save_target is not None, "check": g.check_target is not None}[action]
+        if done:
+            return await interaction.response.send_message("✅ نفّذت دورك بهالليلة.", ephemeral=True)
+        await interaction.response.send_message(content={"kill": "🔪 اختر ضحية الليلة:", "save": "🩺 اختر مين تنقذ:", "check": "🔍 اختر مين تحقق فيه:"}[action], view=TargetSelectView(g, p, action), ephemeral=True)
+
+
+class VoteView(discord.ui.View):
+    def __init__(self, game):
+        super().__init__(timeout=MAFIA_VOTE_SECONDS + 5)
+        self.game = game
+        opts = [discord.SelectOption(label=p.name[:90], value=str(p.id)) for p in game.alive()]
+        opts.append(discord.SelectOption(label="⏭️ تخطي (ما أشك بأحد)", value="0"))
+        self.sel = discord.ui.Select(placeholder="🗳️ صوّت على مين تطرده", options=opts[:25], min_values=1, max_values=1)
+        self.sel.callback = self._vote
+        self.add_item(self.sel)
+
+    async def _vote(self, interaction):
+        g = self.game
+        p = g.players.get(interaction.user.id)
+        if not p or not p.alive:
+            return await interaction.response.send_message("❌ بس الأحياء يصوتون.", ephemeral=True)
+        if g.state != "vote":
+            return await interaction.response.send_message("⌛ انتهى التصويت.", ephemeral=True)
+        tgt = int(self.sel.values[0])
+        if tgt == p.id:
+            return await interaction.response.send_message("❌ ما تقدر تصوّت على نفسك.", ephemeral=True)
+        g.votes[p.id] = tgt
+        who = "تخطي" if tgt == 0 else g.players[tgt].name
+        await interaction.response.send_message(f"🗳️ تم تسجيل تصويتك: **{who}** ({len(g.votes)}/{len(g.alive())})", ephemeral=True)
+        if len(g.votes) >= len(g.alive()):
+            g.vote_event.set()
+
+
+class MafiaPanelView(discord.ui.View):
+    """اللوحة المثبتة بالروم (أزرار دائمة تشتغل حتى بعد إعادة تشغيل البوت)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        b1 = discord.ui.Button(label="🎮 إنشاء لعبة", style=discord.ButtonStyle.success, custom_id="mafia:create")
+        b1.callback = self._create
+        b2 = discord.ui.Button(label="📜 القوانين", style=discord.ButtonStyle.secondary, custom_id="mafia:rules")
+        b2.callback = self._rules
+        self.add_item(b1)
+        self.add_item(b2)
+
+    async def _create(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        err = await mafia_create_lobby(interaction.channel, interaction.user)
+        await interaction.followup.send(err or "✅ انفتحت غرفة اللعبة تحت!", ephemeral=True)
+
+    async def _rules(self, interaction):
+        await interaction.response.defer(ephemeral=True)
+        buf = await _run_sync(_render_list_sync, "قوانين المافيا", MAFIA_RULES_LINES, "الأوامر بدون سلاش داخل هالروم", "dice")
+        await interaction.followup.send(file=discord.File(buf, filename="rules.png"), ephemeral=True)
+
+
+MAFIA_RULES_LINES = [
+    ("الهدف", "الأهالي يكشفون المافيا • المافيا تتخلص من الأهالي"),
+    ("مافيا", "تقتل لاعب كل ليلة (بالاتفاق بينهم)"),
+    ("طبيب", "ينقذ لاعب كل ليلة (نفسه مرة وحدة بس)"),
+    ("شايب", "يكشف هل اللاعب مافيا أو بريء"),
+    ("مواطن", "يناقش ويصوّت ويكشف المافيا"),
+    ("الفوز", "المافيا تفوز لما يتساوى عددها مع الباقين"),
+    ("النهار", f"نقاش {MAFIA_DISCUSS_SECONDS} ثانية ثم تصويت بالقائمة"),
+    ("الأموات", "ينكتمون تلقائياً ولا يكشفون أدوار أحد"),
+    ("المكافأة", f"الفايز {fmt_money(MAFIA_WIN_REWARD)} • الخاسر {fmt_money(MAFIA_PLAY_REWARD)} من البنك"),
+]
+MAFIA_HELP_LINES = [
+    ("مافيا", "يفتح غرفة لعبة جديدة"), ("انضم / خروج", "الدخول أو الانسحاب من الغرفة"),
+    ("ابدأ", "المضيف يبدأ اللعبة (من %d لاعبين)" % MAFIA_MIN_PLAYERS), ("الغاء", "المضيف أو الإدارة يلغي اللعبة"),
+    ("لاعبين", "لوحة اللاعبين والأحياء"), ("تخطي", "المضيف يخلص وقت النقاش"),
+    ("قوانين", "شرح الأدوار وطريقة اللعب"), ("ثبت مافيا", "الإدارة: تثبيت لوحة اللعبة بالروم الحالي"),
+]
+
+
+async def mafia_create_lobby(channel, host):
+    if channel.id in MAFIA_GAMES:
+        return "❌ فيه لعبة شغالة بالروم الحين."
+    game = MafiaGame(channel, host)
+    MAFIA_GAMES[channel.id] = game
+    await game.join(host)
+    buf = await _run_sync(game.lobby_buf)
+    game.lobby_msg = await channel.send(content=f"🎭 **{host.mention}** فتح غرفة مافيا! اضغط **انضم** (من {MAFIA_MIN_PLAYERS} لاعبين).",
+                                        file=discord.File(buf, filename="lobby.png"), view=MafiaLobbyView(game))
+    return None
+
+
+async def ensure_mafia_panel(channel, pin=True):
+    """يرسل لوحة المافيا بالروم ويثبتها (ويحدّث القديمة لو موجودة)."""
+    buf = await _run_sync(_render_mafia_panel)
+    db = load_db()
+    cfg = db.setdefault("mafia", {})
+    old_id = cfg.get("panel")
+    msg = None
+    if old_id and cfg.get("channel") == channel.id:
+        try:
+            msg = await channel.fetch_message(old_id)
+            await msg.edit(attachments=[discord.File(buf, filename="mafia.png")], view=MafiaPanelView())
+        except Exception:
+            msg = None
+    if msg is None:
+        buf = await _run_sync(_render_mafia_panel)
+        msg = await channel.send(file=discord.File(buf, filename="mafia.png"), view=MafiaPanelView())
+    pinned = True
+    if pin:
+        try:
+            await msg.pin()
+        except Exception:
+            pinned = False
+    db = load_db()
+    db.setdefault("mafia", {}).update({"channel": channel.id, "panel": msg.id})
+    save_db(db)
+    return msg, pinned
+
+
+async def mafia_cleanup_mutes(guild_channel):
+    """بعد إعادة تشغيل البوت: يفك الكتم عن لاعبين بقوا مكتومين من لعبة انقطعت."""
+    db = load_db()
+    for pid in list(db.get("mafia", {}).get("muted", [])):
+        m = guild_channel.guild.get_member(pid)
+        if m:
+            try:
+                await guild_channel.set_permissions(m, overwrite=None)
+            except Exception:
+                pass
+    db.setdefault("mafia", {})["muted"] = []
+    save_db(db)
+
+
+MAFIA_WORDS = {
+    "مافيا": "create", "لعبة مافيا": "create", "انضم": "join", "دخول": "join", "خروج": "leave", "انسحب": "leave",
+    "ابدأ": "start", "ابدا": "start", "الغاء": "cancel", "إلغاء": "cancel", "ايقاف": "cancel", "لاعبين": "players",
+    "اللاعبين": "players", "تخطي": "skip", "قوانين": "rules", "اوامر": "help", "أوامر": "help",
+}
+
+
+async def handle_mafia_text(message: discord.Message) -> bool:
+    """أوامر المافيا النصية (بدون سلاش). تشتغل بس بالروم المثبّت."""
+    if not isinstance(message.author, discord.Member):
+        return False
+    text = message.content.strip()
+    if text in ("ثبت مافيا", "تثبيت مافيا"):
+        perms = message.author.guild_permissions
+        if not (perms.administrator or perms.manage_guild):
+            await message.reply("❌ هذا الأمر للإدارة فقط.", mention_author=False)
+            return True
+        msg, pinned = await ensure_mafia_panel(message.channel)
+        await mafia_cleanup_mutes(message.channel)
+        await message.reply("✅ تم تثبيت لوحة المافيا بهالروم!" + ("" if pinned else " (ما قدرت أثبتها، أعطني صلاحية Manage Messages)"), mention_author=False)
+        return True
+    ch_id = mafia_channel_id()
+    if not ch_id or message.channel.id != ch_id:
+        return False
+    word = MAFIA_WORDS.get(text)
+    if not word:
+        return False
+    game = MAFIA_GAMES.get(message.channel.id)
+    user = message.author
+    if word == "create":
+        err = await mafia_create_lobby(message.channel, user)
+        if err:
+            await message.reply(err, mention_author=False)
+    elif word == "rules":
+        buf = await _run_sync(_render_list_sync, "قوانين المافيا", MAFIA_RULES_LINES, "الأوامر بدون سلاش داخل هالروم", "dice")
+        await message.reply(file=discord.File(buf, filename="rules.png"), mention_author=False)
+    elif word == "help":
+        buf = await _run_sync(_render_list_sync, "أوامر المافيا", MAFIA_HELP_LINES, None, "dice")
+        await message.reply(file=discord.File(buf, filename="help.png"), mention_author=False)
+    elif not game:
+        await message.reply("❌ ما فيه لعبة شغالة، اكتب `مافيا` لفتح غرفة.", mention_author=False)
+    elif word == "join":
+        await message.reply(await game.join(user), mention_author=False)
+    elif word == "leave":
+        await message.reply(await game.leave(user), mention_author=False)
+    elif word == "start":
+        err = await game.start(user)
+        if err:
+            await message.reply(err, mention_author=False)
+        else:
+            try:
+                await game.lobby_msg.edit(view=None)
+            except Exception:
+                pass
+    elif word == "cancel":
+        await message.reply(await game.cancel(user), mention_author=False)
+    elif word == "players":
+        buf = await _run_sync(_render_mafia_board, "اللاعبين", game.card_players())
+        await message.reply(file=discord.File(buf, filename="players.png"), mention_author=False)
+    elif word == "skip":
+        if user.id != game.host_id and not user.guild_permissions.administrator:
+            await message.reply("❌ بس المضيف يقدر يخلّص النقاش.", mention_author=False)
+        elif game.state == "day":
+            game.skip_event.set()
+            await message.add_reaction("⏭️")
+        else:
+            await message.reply("❌ التخطي بس وقت النقاش.", mention_author=False)
     return True
 
 
